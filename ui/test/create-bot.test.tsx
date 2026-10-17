@@ -347,17 +347,22 @@ it("reports account discovery failures and keeps sign-in choices available", asy
   expect(screen.getAllByRole("alert").some((alert) => alert.textContent?.includes("verificar as contas"))).toBe(true)
 })
 
-it("lets the user switch the signed-in account from the default surface", async () => {
+it("switches to another signed-in account with the first sign-in chooser", async () => {
   const api = accounts({ codex: "ready", claude: "ready" })
   const create = vi.fn(async () => undefined)
   render(<BotCreateModal api={api} onClose={vi.fn()} onCreate={create} />)
   await screen.findByText(/Usa o Codex/)
-  expect(screen.queryByLabelText("Provedor")).toBeNull()
+  expect(screen.queryByRole("region", { name: "Escolha uma conta" })).toBeNull()
   fireEvent.click(screen.getByRole("button", { name: "Usar outra conta" }))
-  const choice = await screen.findByLabelText("Provedor")
-  await waitFor(() => expect(choice).toHaveFocus())
-  fireEvent.change(choice, { target: { value: "claude" } })
+  const chooser = await screen.findByRole("region", { name: "Escolha uma conta" })
+  expect(within(chooser).getByText("Escolha a conta que este bot vai usar.")).toBeVisible()
+  await waitFor(() => expect(within(chooser).getByRole("button", { name: "Codex" })).toHaveFocus())
+  expect(screen.queryByRole("button", { name: "Usar outra conta" })).toBeNull()
+  fireEvent.click(within(chooser).getByRole("button", { name: "Claude Code" }))
   await screen.findByText(/Usa o Claude Code/)
+  expect(within(chooser).getByRole("button", { name: "Claude Code" })).toHaveAttribute("aria-pressed", "true")
+  expect(screen.queryByRole("button", { name: "Colar token manualmente" })).toBeNull()
+  expect(screen.queryByLabelText("Provedor")).toBeNull()
   fireEvent.change(screen.getByLabelText("Nome"), { target: { value: "Clara" } })
   fireEvent.click(screen.getByRole("button", { name: "Criar bot" }))
   await waitFor(() =>
@@ -366,4 +371,16 @@ it("lets the user switch the signed-in account from the default surface", async 
       expect.stringMatching(/^draft-/),
     ),
   )
+})
+
+it("shows the sign-in flow when the other account is not signed in yet", async () => {
+  const api = accounts({ codex: "ready" })
+  render(<BotCreateModal api={api} onClose={vi.fn()} onCreate={vi.fn(async () => undefined)} />)
+  await screen.findByText(/Usa o Codex/)
+  fireEvent.click(screen.getByRole("button", { name: "Usar outra conta" }))
+  const chooser = await screen.findByRole("region", { name: "Escolha uma conta" })
+  fireEvent.click(within(chooser).getByRole("button", { name: "OpenCode" }))
+  expect(await within(chooser).findByText("Entre em uma conta para criar seu bot.")).toBeVisible()
+  expect(within(chooser).getByRole("region", { name: "Login do provedor nesta máquina" })).toBeVisible()
+  expect(screen.queryByText(/Usa o OpenCode/)).toBeNull()
 })

@@ -477,10 +477,11 @@ export const BotCreateModal = ({
   >({ machine: "local", machineIdleMinutes: 10, vmProviderLogin: false, hostComputerUse: false })
   const [saving, setSaving] = useState(false)
   const signInRef = useRef<HTMLElement>(null)
-  // The default surface names the account only; the choice itself lives in Advanced.
+  // A signed-in account is used by default; "Use another account" opens the same chooser as first sign-in.
+  const [choosingAccount, setChoosingAccount] = useState(false)
   const showAccountChoice = (): void => {
-    setAdvanced(true)
-    requestAnimationFrame(() => document.getElementById("bot-provider")?.focus())
+    setChoosingAccount(true)
+    requestAnimationFrame(() => signInRef.current?.querySelector<HTMLElement>('[aria-pressed="true"]')?.focus())
   }
   const chooseProvider = (next: Bot["provider"]): void => {
     setError(null)
@@ -624,9 +625,11 @@ export const BotCreateModal = ({
                           host: host === "mac" ? "Mac" : t("onboarding.server"),
                         })}
                       </p>
-                      <button type="button" className="text-button" onClick={showAccountChoice}>
-                        {t("Use another account")}
-                      </button>
+                      {!choosingAccount && (
+                        <button type="button" className="text-button" onClick={showAccountChoice}>
+                          {t("Use another account")}
+                        </button>
+                      )}
                     </>
                   )
                 ))}
@@ -640,13 +643,15 @@ export const BotCreateModal = ({
                 anyFolderAccess={anyFolderAccess}
               />
             </div>
-            {api && machine.machine !== "cloud" && !login.checking && !login.ready && (
+            {api && machine.machine !== "cloud" && (choosingAccount || (!login.checking && !login.ready)) && (
               <section ref={signInRef} tabIndex={-1} className="bot-create-login" aria-label={t("Choose an account")}>
                 <p>
                   {t(
-                    login.flow?.executable === "missing"
-                      ? "onboarding.installFirst"
-                      : "Sign in to an account to create your bot.",
+                    login.checking || login.ready
+                      ? "Choose the account this bot will use."
+                      : login.flow?.executable === "missing"
+                        ? "onboarding.installFirst"
+                        : "Sign in to an account to create your bot.",
                   )}
                 </p>
                 <div className="bot-create-accounts">
@@ -662,7 +667,7 @@ export const BotCreateModal = ({
                     </button>
                   ))}
                 </div>
-                {login.flow?.executable === "missing" ? (
+                {login.checking || login.ready ? null : login.flow?.executable === "missing" ? (
                   <ProviderInstallation
                     provider={provider}
                     host={host}
