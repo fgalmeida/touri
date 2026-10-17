@@ -346,3 +346,24 @@ it("reports account discovery failures and keeps sign-in choices available", asy
   expect(await screen.findByRole("region", { name: "Escolha uma conta" })).toBeVisible()
   expect(screen.getAllByRole("alert").some((alert) => alert.textContent?.includes("verificar as contas"))).toBe(true)
 })
+
+it("lets the user switch the signed-in account from the default surface", async () => {
+  const api = accounts({ codex: "ready", claude: "ready" })
+  const create = vi.fn(async () => undefined)
+  render(<BotCreateModal api={api} onClose={vi.fn()} onCreate={create} />)
+  await screen.findByText(/Usa o Codex/)
+  expect(screen.queryByLabelText("Provedor")).toBeNull()
+  fireEvent.click(screen.getByRole("button", { name: "Usar outra conta" }))
+  const choice = await screen.findByLabelText("Provedor")
+  await waitFor(() => expect(choice).toHaveFocus())
+  fireEvent.change(choice, { target: { value: "claude" } })
+  await screen.findByText(/Usa o Claude Code/)
+  fireEvent.change(screen.getByLabelText("Nome"), { target: { value: "Clara" } })
+  fireEvent.click(screen.getByRole("button", { name: "Criar bot" }))
+  await waitFor(() =>
+    expect(create).toHaveBeenCalledWith(
+      expect.objectContaining({ provider: "claude" }),
+      expect.stringMatching(/^draft-/),
+    ),
+  )
+})

@@ -477,6 +477,11 @@ export const BotCreateModal = ({
   >({ machine: "local", machineIdleMinutes: 10, vmProviderLogin: false, hostComputerUse: false })
   const [saving, setSaving] = useState(false)
   const signInRef = useRef<HTMLElement>(null)
+  // The default surface names the account only; the choice itself lives in Advanced.
+  const showAccountChoice = (): void => {
+    setAdvanced(true)
+    requestAnimationFrame(() => document.getElementById("bot-provider")?.focus())
+  }
   const chooseProvider = (next: Bot["provider"]): void => {
     setError(null)
     setModel("")
@@ -612,12 +617,17 @@ export const BotCreateModal = ({
                   <p>{t("onboarding.checking", { host: host === "mac" ? "Mac" : t("onboarding.server") })}</p>
                 ) : (
                   login.ready && (
-                    <p>
-                      {t("onboarding.uses", {
-                        provider: providerName(provider),
-                        host: host === "mac" ? "Mac" : t("onboarding.server"),
-                      })}
-                    </p>
+                    <>
+                      <p>
+                        {t("onboarding.uses", {
+                          provider: providerName(provider),
+                          host: host === "mac" ? "Mac" : t("onboarding.server"),
+                        })}
+                      </p>
+                      <button type="button" className="text-button" onClick={showAccountChoice}>
+                        {t("Use another account")}
+                      </button>
+                    </>
                   )
                 ))}
               <BotAccessSummary
