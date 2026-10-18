@@ -109,6 +109,15 @@ it("offers the Claude Code model aliases and saves one", async () => {
   fireEvent.click(within(dialog).getByRole("button", { name: "Salvar modelo" }))
 
   await waitFor(() => expect(bot.model).toBe("sonnet"))
+  expect(await screen.findByRole("button", { name: "Modelo: Claude Code · Sonnet" })).toBeVisible()
+})
+
+it("starts a custom Claude Code model name empty instead of copying the saved alias", async () => {
+  const { dialog } = await openPicker("claude", undefined, "sonnet")
+
+  fireEvent.change(within(dialog).getByRole("combobox", { name: "Modelo" }), { target: { value: "__custom-model__" } })
+
+  expect(within(dialog).getByRole("textbox", { name: "Nome do modelo" })).toHaveValue("")
 })
 
 it("lets the user type another Claude Code model name", async () => {

@@ -3,16 +3,9 @@ import { useEffect, useId, useState } from "react"
 import type { UiApi } from "../api/client"
 import { useApiModels } from "../features/bots/apiModels"
 import { t } from "../i18n"
-import { getBotModelName, providerName } from "./ProviderMark"
+import { CLAUDE_MODELS, getBotModelName, getClaudeModelLabel, providerName } from "./ProviderMark"
 
-/** Claude Code model aliases; each one always resolves to the latest model of that family. */
-const CLAUDE_MODELS = [
-  { id: "opus", label: "Opus" },
-  { id: "sonnet", label: "Sonnet" },
-  { id: "haiku", label: "Haiku" },
-] as const
 const CUSTOM_MODEL = "__custom-model__"
-const getClaudeModelLabel = (id: string): string | undefined => CLAUDE_MODELS.find((model) => model.id === id)?.label
 
 export const ProviderModelField = ({
   id,
@@ -129,6 +122,8 @@ export const ProviderModelField = ({
           onChange={(event) => {
             const next = event.target.value
             setTyping(next === CUSTOM_MODEL)
+            // A custom name starts empty, or keeps the last custom name, never the selected alias.
+            if (next === CUSTOM_MODEL && getClaudeModelLabel(value)) onChange("")
             if (next !== CUSTOM_MODEL) onChange(next)
           }}
           disabled={disabled}
