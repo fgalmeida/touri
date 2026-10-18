@@ -160,6 +160,7 @@ export const ProviderModelField = ({
       {showSelect && typing && (
         <input
           aria-label={t("Model name")}
+          placeholder={t("Model name")}
           value={value}
           onChange={(event) => onChange(event.target.value)}
           disabled={disabled}
