@@ -37,12 +37,48 @@ button:disabled {
   cursor: not-allowed;
   opacity: var(--opacity-disabled);
 }
-button:focus-visible,
+button:focus-visible {
+  outline: 2px solid var(--accent-info);
+  outline-offset: 2px;
+}
+/* Text fields match :focus-visible on every click, so they show focus with their own border, not an outer ring. */
 input:focus-visible,
 textarea:focus-visible,
 select:focus-visible {
+  outline: none;
+  border-color: var(--border-focus);
+  box-shadow: 0 0 0 1px var(--border-focus);
+}
+input:is([type="checkbox"], [type="radio"], [type="range"]):focus-visible {
   outline: 2px solid var(--accent-info);
   outline-offset: 2px;
+  box-shadow: none;
+}
+/*
+ * Base look for form controls and quiet buttons that no component styles. Zero specificity (:where)
+ * keeps every component rule in charge; it only replaces the browser's native look, which is
+ * jarring in WebView2 on Windows and Linux.
+ */
+:where(input:not([type="checkbox"], [type="radio"], [type="range"], [type="color"], [type="file"]), textarea, select) {
+  min-height: var(--control-size-compact);
+  padding: var(--space-6) var(--space-10);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-8);
+  background: var(--surface-settings-input);
+  color: var(--text-primary);
+}
+:where(input[type="checkbox"], input[type="radio"]) {
+  accent-color: var(--accent-brand);
+}
+:where(.button-quiet, .outline-button) {
+  padding: var(--space-8) var(--space-12);
+  border-radius: var(--radius-8);
+  font-size: var(--type-12);
+}
+/* Thin themed scrollbars; classic Windows scrollbars bring arrow buttons and a light track. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar-sidebar) transparent;
 }
 a {
   color: var(--text-primary);
