@@ -251,7 +251,7 @@
   border-color: var(--border-hover);
 }
 .modal-card.settings-modal :is(input, select, textarea):focus-visible {
-  border-color: var(--border-focus);
+  border-color: var(--field-focus);
 }
 .modal-card.settings-modal :is(input, select, textarea):disabled {
   cursor: not-allowed;
@@ -264,8 +264,8 @@
 /* Fields match :focus-visible on every click; their border shows focus instead of an outer ring. */
 .settings-modal :is(input:not([type="checkbox"], [type="radio"], [type="range"]), select, textarea):focus-visible {
   outline: none;
-  border-color: var(--border-focus);
-  box-shadow: 0 0 0 1px var(--border-focus);
+  border-color: var(--field-focus);
+  box-shadow: 0 0 0 1px var(--field-focus);
 }
 .settings-modal input:is([type="checkbox"], [type="radio"], [type="range"]):focus-visible {
   outline: 2px solid var(--accent-info);

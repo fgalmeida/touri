@@ -104,8 +104,8 @@
 }
 .routine-editor :is(input:not([type="checkbox"], [type="radio"]), select, textarea):focus-visible {
   outline: none;
-  border-color: var(--border-focus);
-  box-shadow: 0 0 0 1px var(--border-focus);
+  border-color: var(--field-focus);
+  box-shadow: 0 0 0 1px var(--field-focus);
 }
 .routine-run-history {
   padding: 12px;
