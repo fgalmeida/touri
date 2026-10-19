@@ -125,8 +125,8 @@ export type StandingGrant = { id: Id; botId: Id; scope: ApprovalScope; grantedAt
 export type BotCapability = 'browser' | 'computer_use'
 export type CapabilityRequestInput = { capability: BotCapability; reason: string }
 
-export type ApprovalInput = { groupMemberId?: Id; ctx: Pick<ToolContext, 'botId' | 'threadId' | 'runId' | 'signal'>; scope: ApprovalScope; toolName: string; input: unknown; toolUseId?: string; allowStanding?: boolean; isCurrent?: () => boolean }
-export type ApprovalResult = Result<{ behavior: 'allow' | 'deny'; updatedInput?: unknown; message?: string }, 'NOT_FOUND' | 'TIMEOUT' | 'DENIED'>
+export type ApprovalInput = { groupMemberId?: Id; ctx: Pick<ToolContext, 'botId' | 'threadId' | 'runId' | 'signal'>; scope: ApprovalScope; toolName: string; input: unknown; toolUseId?: string; allowStanding?: boolean; teamProposal?: TeamProposalReview; isCurrent?: () => boolean }
+export type ApprovalResult = Result<{ behavior: 'allow' | 'deny'; approvalId?: Id; updatedInput?: unknown; message?: string }, 'NOT_FOUND' | 'TIMEOUT' | 'DENIED'>
 
 export type BotFolder = { path: AbsolutePath; access: 'read-only' | 'read-write' }
 export type BotBrowser = 'touri' | 'local' | 'machine'
@@ -140,6 +140,8 @@ export type Bot = {
   providerProfile?: string | null
   claudeAiConnectors?: boolean
 
+  /** Set only by explicit creation from the team-builder job; immutable afterward. */
+  teamBuilder: boolean
   id: Id
   name: string
   title: string | null
@@ -273,6 +275,7 @@ export type RunErrorClass =
   | 'oom'
   | 'tool_error'
   | 'app_restart'
+  | 'group_context_missing'
   | 'unknown'
 
 export type RunUsage = {
@@ -410,6 +413,7 @@ export type NoticePart = {
     | 'group_ask_all'
     | 'group_summary'
     | 'group_member_removed'
+    | 'group_coordination_prompt'
     | 'run_failed'
     | 'run_canceled'
     | 'session_replaced'
@@ -425,6 +429,8 @@ export type NoticePart = {
 export type ApprovalPart = {
   /** A delegation approval belongs to the caller but waits on this group member. */
   groupMemberId?: Id
+  teamProposal?: TeamProposalReview
+  teamResult?: TeamCreationResult
   type: 'approval'
   createdAt?: EpochMs
   approvalId: Id
@@ -778,7 +784,32 @@ export type ProviderAdapter = {
 /* origin. WebSocket: /api/v1/events?token=<token> (token also accepted as subprotocol).       */
 /* ------------------------------------------------------------------------------------------ */
 
-export type CreateBotInput = { cloudApiKey?: string } & Pick<Bot, 'name' | 'provider'> &
+export type TeamBotDraft = Pick<Bot, 'name' | 'provider' | 'instructions'> & {
+  roleLine: string
+  model?: string | null
+  color?: string | null
+  avatarShape?: AvatarShape | null
+  avatarSeed?: string | null
+}
+/** Group members refer only to names of bots in this proposal. */
+export type TeamCreateInput = {
+  bots: Array<TeamBotDraft>
+  group?: { name: string; members: Array<string>; coordinator?: string }
+}
+export type TeamProviderStatus = 'ready' | 'needs-setup' | 'unknown'
+export type TeamProposalReview = {
+  proposal: TeamCreateInput
+  providers: Array<{ provider: Provider; status: TeamProviderStatus }>
+}
+export type TeamCreationResult = {
+  status: 'created' | 'partial' | 'failed'
+  bots: Array<{ id: Id; name: string; threadId: Id | null }>
+  group?: { id: Id; name: string; threadId: Id }
+  /** Fixed public failure code; never raw filesystem/provider errors. */
+  error?: 'creation-failed'
+}
+
+export type CreateBotInput = { cloudApiKey?: string; jobId?: string } & Pick<Bot, 'name' | 'provider'> &
   Partial<Pick<Bot, 'title' | 'roleLine' | 'description' | 'color' | 'avatarShape' | 'avatarSeed' | 'instructions' | 'model' | 'reasoningEffort' | 'access' | 'approvals' | 'projectId' | 'cwd' | 'browserEnabled' | 'browser' | 'computerUse' | 'machine' | 'machineIdleMinutes' | 'vmProviderLogin' | 'hostComputerUse' | 'folders' | 'anyFolderAccess' | 'providerProfile' | 'claudeAiConnectors'>>
 
 /** A named login under `<appData>/provider-profiles/<name>`, created with `touri profile login`. */
@@ -855,7 +886,7 @@ export type ApiRoutes = {
   'POST /cloud/bots/:id/wake': { req: {}; res: { machine: MachineState } }
   'PUT /cloud/bots/:id/key': { req: { apiKey: string }; res: {} }
 
-  'GET /health': { req: {}; res: { ok: true; version: string; schemaVersion: number; host?: 'mac' | 'server'; hostKind?: HostKind; historyMigration?: { running: boolean; done: number; total: number }; eventLoop?: { lagMs: number; p99Ms: number; maxMs: number; samples: number } } }
+  'GET /health': { req: {}; res: { ok: true; version: string; schemaVersion: number; draining?: boolean; host?: 'mac' | 'server'; hostKind?: HostKind; historyMigration?: { running: boolean; done: number; total: number }; eventLoop?: { lagMs: number; p99Ms: number; maxMs: number; samples: number } } }
   'POST /ui/errors': { req: { area: string; message: string; stack: string; componentStack: string }; res: { ok: true } }
   'POST /reports/:id/saved': { req: { destination: 'zip' | 'github' }; res: {} }
   'POST /reports/history': { req: { history: import('./reports').ReportHistory[] }; res: {} }
@@ -867,7 +898,7 @@ export type ApiRoutes = {
   'POST /doctor/storage/compact': { req: { vacuum?: boolean }; res: { maintenance: StorageMaintenanceStatus } }
   'GET /bots': { req: {}; res: { bots: Array<Bot> } }
   'POST /bots': { req: CreateBotInput; res: { bot: Bot } }
-  'PATCH /bots/:id': { req: Partial<CreateBotInput & { paused: boolean }>; res: { bot: Bot } }
+  'PATCH /bots/:id': { req: Partial<Omit<CreateBotInput, 'jobId'> & { paused: boolean }>; res: { bot: Bot } }
   'DELETE /bots/:id': { req: { name: string; deleteVolumes?: boolean }; res: {} }
   'GET /bots/:id/mcp': { req: {}; res: { servers: Array<McpServer> } }
   'GET /bots/:id/integrations/telegram': { req: {}; res: { telegram: TelegramIntegration } }
@@ -925,7 +956,7 @@ export type ApiRoutes = {
   'GET /threads/:id/transcript': { req: { since?: number; limit?: number }; res: { entries: Array<{ seq: number; generation: number; event: UiEvent }>; rejections: Array<TranscriptRejection>; lastSeq: number; generation: number; hasMore: boolean; resync: boolean } }
   'GET /threads/:id/messages': { req: { all?: boolean }; res: { messages: Array<Message>; activeLeafId: Id | null } }
   'POST /threads/:id/messages': { req: SendMessageInput; res: { message: Message; run: Run } }
-  'GET /runs': { req: Record<string, never>; res: { runs: Array<Run> } }
+  'GET /runs': { req: Record<string, never>; res: { runs: Array<Run>; draining?: boolean } }
   'GET /threads/:id/goal': { req: {}; res: { goal: Goal | null } }
   'POST /threads/:id/goal': { req: GoalStart; res: { goal: Goal } }
   'PATCH /threads/:id/goal': { req: GoalControl; res: { goal: Goal } }
@@ -1111,7 +1142,13 @@ export type NotificationPreferences = NotificationScopePreferences & {
 }
 
 export type NotifyResolution = 'allow' | 'deny' | 'answer' | 'replied' | 'dismissed' | 'expired' | 'canceled'
-export type AvatarShape = import('@norbert_bodziony/bloub').ShapeId
+export type AvatarHorns = 'classic' | 'short' | 'long' | 'none'
+export type AvatarAccessory = 'none' | 'ring' | 'glasses' | 'headphones' | 'cap' | 'flower' | 'crown'
+/** Bull look, horns then accessory (`short-flower`). */
+export type AvatarBullShape = `${AvatarHorns}-${AvatarAccessory}`
+/** Silhouette ids saved before the bulls; still accepted, rendered as the seeded automatic look. */
+export type AvatarLegacyShape = 'cercle' | 'galet' | 'squircle' | 'capsule' | 'triangle' | 'hexagone' | 'nuage'
+export type AvatarShape = AvatarBullShape | AvatarLegacyShape
 
 /** Persisted notification. `id` is stable; `requestId` is set for approval/question and is what `respond` takes. */
 export type NotificationRecord = {
@@ -1285,8 +1322,15 @@ export type StoreApi = {
   insertMessage: (args: { message: Omit<Message, 'createdAt' | 'updatedAt'> }) => Result<{ message: Message }, 'THREAD_NOT_FOUND' | 'PARENT_NOT_FOUND'>
   appendDelta: (args: TranscriptAppend) => void
   appendParts?: (args: { threadId: Id; messageId: Id; parts: Array<{ partIndex: number; part: MessagePart }>; generation?: number }) => void
-  flushWrites?: () => void
+  flushWrites?: (options?: { stopping?: boolean }) => void
+  flushWritesAsync?: (options?: { stopping?: boolean; threadId?: Id; messageId?: Id }) => Promise<void>
+  closeStreamWriterIfIdle?: () => boolean
   updateMessage: (args: { threadId: Id; messageId: Id; patch: Partial<Pick<Message, 'status' | 'parts' | 'text' | 'runId'>> }) => Result<{ message: Message }, 'NOT_FOUND'>
+  updateMessageAsync?: (args: {
+    threadId: Id
+    messageId: Id
+    patch: Partial<Pick<Message, 'status' | 'parts' | 'text' | 'runId'>>
+  }) => Promise<Result<{ message: Message }, 'NOT_FOUND'>>
   /** Select before hydrating bodies; fromRoot selects the oldest prefix instead of the recent tail. */
   activePath: (args: { threadId: Id; leafId?: Id; limit?: number; fromRoot?: boolean }) => Array<Message>
   getPathMessage?: (args: { threadId: Id; messageId: Id; leafId?: Id }) => Message | null
@@ -1300,16 +1344,21 @@ export type StoreApi = {
 
 /** Cross-module services. Providers call `provide` in their init; consumers must tolerate `null` from `use`. */
 export type ServiceMap = {
+  'bots.validateCreation': (body: unknown) => Result<{ input: CreateBotInput }>
+  'bots.create': (input: { body: unknown; signal: AbortSignal; isCurrent?: () => boolean }) => Promise<Result<{ bot: Bot }>>
+  'approvals.completeTeam': (input: { approvalId: Id; ctx: Pick<ToolContext, 'botId' | 'threadId' | 'runId'>; result: TeamCreationResult }) => Promise<void>
   'bots.rename': (input: { botId: Id; name: string }) => Result<{ bot: Bot }, 'NOT_FOUND' | 'INVALID_ARGS'>
   'bots.configureAccess': (input: { botId: Id; patch: Partial<Pick<Bot, 'projectId' | 'folders' | 'browserEnabled' | 'browser' | 'computerUse'>> }) => Result<{ bot: Bot }, 'NOT_FOUND' | 'INVALID_ARGS' | 'MACHINE_PROJECT_CHANGE'>
   'diagnostics.errors': () => Array<{ code: string; at: number }>
   'groups.runtime': {
-    enqueue: (args: { threadId: Id; requestMessageId: Id; trigger: RunTrigger; routineRunId?: Id }) => Result<{ run: Run }, 'THREAD_NOT_FOUND' | 'BOT_PAUSED' | 'DELEGATION_LIMIT'>
+    enqueue: (args: { threadId: Id; requestMessageId: Id; trigger: RunTrigger; routineRunId?: Id }) => Result<{ run: Run }, 'THREAD_NOT_FOUND' | 'BOT_PAUSED' | 'DELEGATION_LIMIT' | 'RUNTIME_DRAINING'>
     cancel: (id: Id) => boolean
     cancelGroupTurns: (args: { groupId: Id }) => Promise<void>
-    retry: (id: Id) => Result<{ run: Run }, 'THREAD_NOT_FOUND' | 'BOT_PAUSED' | 'DELEGATION_LIMIT' | 'CONFLICT'> | null
+    retry: (id: Id) => Result<{ run: Run }, 'THREAD_NOT_FOUND' | 'BOT_PAUSED' | 'DELEGATION_LIMIT' | 'RUNTIME_DRAINING' | 'CONFLICT'> | null
     listRuns: (threadId: Id) => Array<Run>
-    shutdown: () => void
+    beginDrain: () => void
+    waitForDrain: () => Promise<void>
+    shutdown: (options?: { appRestart?: boolean }) => void
     canCoordinate: (threadId: Id) => boolean
   }
   'vm.stopShells': () => void
@@ -1326,7 +1375,7 @@ export type ServiceMap = {
   'approvals.approve': (input: { approvalId: Id; decision: 'approved' | 'denied'; standing?: boolean; message?: string }) => Promise<Result<{}, 'NOT_FOUND'>>
   'approvals.settle': (input: { approvalId: Id; decision: 'denied' | 'expired' }) => void
   'doctor': { start: () => void; dispose: () => void; snapshot: (refresh?: boolean) => DoctorReport; settled: () => Promise<void> }
-  'storage.maintenance': { scheduleSessionKeyRetry: () => void; start: (vacuum?: boolean) => boolean; snapshot: () => StorageMaintenanceStatus; dispose: () => void }
+  'storage.maintenance': { scheduleSessionKeyRetry: () => void; start: (vacuum?: boolean) => boolean; snapshot: () => StorageMaintenanceStatus; dispose: (options?: { closing?: boolean }) => void }
   'mcp.botTools': (bot: Bot) => Array<string>
 
   'cloud.settingsChanged': () => void
@@ -1336,13 +1385,15 @@ export type ServiceMap = {
   'vm.shutdown': () => Promise<void>
   'vm.desktop': VmDesktop
   'store.api': StoreApi
-  'runtime.enqueue': (args: { threadId: Id; requestMessageId: Id; trigger: RunTrigger }) => Result<{ run: Run }, 'THREAD_NOT_FOUND' | 'BOT_PAUSED' | 'DELEGATION_LIMIT'>
+  'runtime.enqueue': (args: { threadId: Id; requestMessageId: Id; trigger: RunTrigger }) => Result<{ run: Run }, 'THREAD_NOT_FOUND' | 'BOT_PAUSED' | 'DELEGATION_LIMIT' | 'RUNTIME_DRAINING'>
+  'runtime.isDraining': () => boolean
+  'runtime.beginDrain': () => Promise<void>
   'runtime.settingsChanged': () => void
   'runtime.activeRun': (args: { threadId: Id }) => Run | null
   'runtime.continueAfterApproval': (ctx: Pick<ToolContext, 'botId' | 'threadId' | 'runId' | 'signal'>) => boolean
   'runtime.cancelBotTurns': (args: { botId: Id }) => Promise<void>
   'runtime.cancelRun': (args: { runId: Id }) => boolean
-  'runtime.shutdown': () => Promise<void>
+  'runtime.shutdown': (options?: { appRestart?: boolean }) => Promise<void>
   'projects.info': (args: { projectId: Id; botId?: Id }) => Promise<ProjectInfo | null>
   'browser.tabsForBot': (args: { botId: Id }) => Array<BrowserTabInfo>
   'computer.input': ComputerInput

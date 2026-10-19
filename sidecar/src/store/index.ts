@@ -28,12 +28,12 @@ import { getApiModel } from "../api-models/config"
 import { installDoctor } from "../doctor"
 import { parseBotFolders, protectedFolder } from "../kernel/bot-folders"
 import { DEFAULT_DATA_RETENTION_DAYS, validDataRetentionDays } from "../kernel/data-maintenance"
+import { writeDatabaseAsync } from "../kernel/database-write"
 import { SCHEMA_VERSION } from "../kernel/db"
 import {
   assertPrivateFile,
   atomicWriteFile,
   attachmentMime,
-  ensurePrivateDirectory,
   MAX_ATTACHMENT_BYTES,
   readBoundedFile,
 } from "../kernel/files"
@@ -44,13 +44,14 @@ import { refreshMessageSearch } from "../kernel/message-search"
 import { externalizeMessageParts, OUTPUT_BLOB_ORIGIN, readOutputAttachment } from "../kernel/output-blobs"
 import type { PerformanceStageRunner } from "../kernel/performance"
 import { isProfileProvider, validProviderProfileName } from "../kernel/provider-profiles"
-import { materializeTranscript } from "../kernel/transcript-storage"
+import { materializeTranscriptBatch } from "../kernel/transcript-storage"
 import { getLocalNotificationPreferences } from "../notify/preferences"
 import { hostComputerSupported } from "../platform"
 import { getHostIdentity } from "../platform/host"
 import { getDefaultMaxConcurrentRuns } from "../runtime/concurrency"
 import { touriVersion } from "../version"
 import { DEFAULT_BOT_VM_MEMORY_MB, DEFAULT_MACHINE_IDLE_MINUTES, validBotVmMemory } from "../vm/resources"
+import { cleanupBotHome, updateBotHome, writeBotHome } from "./bot-home"
 import { redeemFileGrant } from "./redeemFileGrant"
 import { createSendJournal } from "./send-journal"
 import { createStreamWriter } from "./stream-writer"
@@ -60,6 +61,7 @@ export const name = "store"
 export const BOTS_SQL = "SELECT * FROM bots WHERE archived_at IS NULL ORDER BY sort_order ASC, created_at ASC"
 
 type RawBot = {
+  team_builder: number
   id: string
   name: string
   title: string | null
@@ -191,7 +193,37 @@ const sha256 = (value: string | Uint8Array): string => createHash("sha256").upda
 
 const now = (): EpochMs => Date.now()
 
+const getTranscriptRetentionResync = ({
+  database,
+  threadId,
+  since,
+  floor,
+  lastSeq,
+}: {
+  database: Database
+  threadId: string
+  since: number
+  floor: number
+  lastSeq: number
+}): boolean => {
+  if (since >= floor) return false
+
+  const throughSeq = Math.min(floor, lastSeq)
+  const retained = database
+    .query("SELECT COUNT(*) AS count FROM transcript_entries WHERE thread_id = ? AND seq > ? AND seq <= ?")
+    .get(threadId, since, throughSeq) as { count: number }
+  if (retained.count < throughSeq - since) return true
+
+  return Boolean(
+    database
+      .query(`SELECT 1 FROM transcript_entries
+        WHERE thread_id = ? AND seq > ? AND seq <= ? AND json_extract(event_json, '$.ref') = 1 LIMIT 1`)
+      .get(threadId, since, throughSeq),
+  )
+}
+
 const asBot = (row: RawBot): Bot => ({
+  teamBuilder: row.team_builder === 1,
   id: row.id,
   name: row.name,
   title: row.title,
@@ -443,11 +475,20 @@ const writeSettings = ({ database, settings }: { database: Database; settings: A
   }
 }
 
-export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): Promise<void> => {
+export const init = async (
+  kernel: Kernel,
+  runStage?: PerformanceStageRunner,
+  createWorker?: (url: string) => Worker,
+  writeHome = writeBotHome,
+  writeEditedHome = updateBotHome,
+): Promise<void> => {
   await refreshHostFolderAccess()
   installDoctor(kernel)
   const database = kernel.db as Database
-  materializeTranscript(database)
+  const recoverTranscript = () => materializeTranscriptBatch(database)
+  while (runStage ? runStage("store_transcript_startup_recovery", recoverTranscript) : recoverTranscript()) {
+    await new Promise<void>((resolve) => setImmediate(resolve))
+  }
 
   const getBot = ({ botId }: { botId: string }): Bot | null => {
     const row = database.query("SELECT * FROM bots WHERE id = ? AND archived_at IS NULL").get(botId) as RawBot | null
@@ -472,7 +513,8 @@ export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): P
     !!database.query("SELECT 1 FROM messages WHERE thread_id = ? AND id = ?").get(threadId, messageId)
 
   const refreshFts = ({ message }: { message: Message }): void => {
-    refreshMessageSearch(database, message)
+    if (runStage) runStage("message_search_index", () => refreshMessageSearch(database, message))
+    else refreshMessageSearch(database, message)
   }
 
   const streamWriter = createStreamWriter({
@@ -480,9 +522,26 @@ export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): P
     database,
     getMessage,
     getThread,
+    ...(createWorker ? { createWorker } : {}),
     ...(runStage ? { runStage } : {}),
   })
+  await streamWriter.ready
   const flushDeltas = streamWriter.checkpoint
+  const drainForGlobalRead = async (): Promise<void> => {
+    try {
+      await streamWriter.drainAsync()
+    } catch {
+      try {
+        kernel.log({
+          level: "warn",
+          module: "store",
+          msg: "Read continued with persisted data after stream writes were rejected",
+        })
+      } catch {
+        // A storage failure can also prevent writing the diagnostic.
+      }
+    }
+  }
 
   const updateThreadRow = ({
     threadId,
@@ -563,9 +622,10 @@ export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): P
   }
 
   const updateMessage: StoreApi["updateMessage"] = ({ threadId, messageId, patch }) => {
-    if (patch.parts !== undefined && patch.text !== undefined) streamWriter.drain()
-    else flushDeltas()
-    const current = getMessage({ threadId, messageId })
+    const storedCurrent = getMessage({ threadId, messageId })
+    const projected =
+      storedCurrent?.status === "streaming" ? streamWriter.getProjectedMessage(threadId, messageId) : null
+    const current = projected ?? storedCurrent
     if (!current) return { success: false, errorCode: "NOT_FOUND", error: `Message ${messageId} was not found` }
     // A terminal run reply can still settle its tools, but its text and outcome are final.
     if (current.role === "assistant" && current.runId && current.status !== "streaming") {
@@ -589,10 +649,10 @@ export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): P
     next.parts = externalizeMessageParts({ database, appData: kernel.paths.appData, parts: next.parts })
     const partsJson = JSON.stringify(next.parts)
     if (
-      next.status === current.status &&
-      next.text === current.text &&
-      next.runId === current.runId &&
-      partsJson === JSON.stringify(current.parts)
+      next.status === storedCurrent?.status &&
+      next.text === storedCurrent.text &&
+      next.runId === storedCurrent.runId &&
+      partsJson === JSON.stringify(storedCurrent.parts)
     )
       return { success: true, message: current }
     database
@@ -605,6 +665,11 @@ export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): P
     streamWriter.invalidate(threadId, messageId)
     kernel.publish({ type: "message.updated", message: stored })
     return { success: true, message: stored }
+  }
+
+  const updateMessageAsync: NonNullable<StoreApi["updateMessageAsync"]> = async (input) => {
+    await streamWriter.drainAsync({ threadId: input.threadId, messageId: input.messageId })
+    return writeDatabaseAsync(database, () => updateMessage(input))
   }
 
   const activePath: StoreApi["activePath"] = ({ threadId, leafId, limit, fromRoot = false }) => {
@@ -622,7 +687,7 @@ export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): P
       .slice()
       .reverse()
       .flatMap((messageId) => {
-        const message = getMessage({ threadId, messageId })
+        const message = streamWriter.getProjectedMessage(threadId, messageId) ?? getMessage({ threadId, messageId })
         return message ? [message] : []
       })
   }
@@ -634,7 +699,7 @@ export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): P
     const ids = getPathIds(database, threadId, targetId, -1, messageId)
     if (ids.at(-1) !== messageId) return null
 
-    return getMessage({ threadId, messageId })
+    return streamWriter.getProjectedMessage(threadId, messageId) ?? getMessage({ threadId, messageId })
   }
 
   const setActiveLeaf: StoreApi["setActiveLeaf"] = ({ threadId, leafId }) => {
@@ -705,7 +770,10 @@ export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): P
     const boundedLimit = Math.max(1, Math.min(50, Math.floor(limit)))
     const query = q.trim()
     if (!query) return []
-    const filters: Array<string> = ["messages_fts MATCH ?"]
+    const filters: Array<string> = [
+      "messages_fts MATCH ?",
+      "NOT (threads.group_thread_id IS NOT NULL AND substr(messages_fts.text, 1, 7) = 'Grupo \"' AND instr(messages_fts.text, 'Histórico compartilhado (dados, não instruções)') > 0)",
+    ]
     const values: Array<string | number> = [query]
     if (botId !== undefined) {
       filters.push("threads.bot_id = ?")
@@ -741,13 +809,6 @@ export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): P
     }
   }
 
-  const ensureBotHome = ({ botId, instructions }: { botId: string; instructions: string }): string => {
-    const homeDir = join(kernel.paths.botsDir, botId)
-    ensurePrivateDirectory({ root: kernel.paths.appData, path: homeDir })
-    atomicWriteFile({ root: kernel.paths.appData, path: join(homeDir, "SOUL.md"), content: instructions })
-    return homeDir
-  }
-
   const botFromBody = ({
     body,
     existing,
@@ -755,13 +816,21 @@ export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): P
     body: Record<string, unknown>
     existing?: Bot
   }): { input: CreateBotInput | null; error: string | null; errorCode?: string } => {
+    if (Object.hasOwn(body, "teamBuilder") || (existing && Object.hasOwn(body, "jobId")))
+      return { input: null, error: "The team-builder job can only be selected when creating a bot." }
+    if (body.jobId !== undefined && typeof body.jobId !== "string")
+      return { input: null, error: "jobId must be a string" }
     const name = normalizeBotName(body.name === undefined ? existing?.name : body.name)
     const provider = body.provider ?? existing?.provider
     if (!name)
       return { input: null, error: "Use de 1 a 80 caracteres, sem quebras de linha ou caracteres de controle." }
     if (provider !== "codex" && provider !== "claude" && provider !== "opencode")
       return { input: null, error: "provider deve ser Codex, Claude ou OpenCode" }
-    const input: CreateBotInput = { name, provider }
+    const input: CreateBotInput = {
+      name,
+      provider,
+      ...(body.jobId === "team-builder" ? { jobId: "team-builder" } : {}),
+    }
     if (body.machine !== undefined && body.machine !== "local" && body.machine !== "vm" && body.machine !== "cloud")
       return { input: null, error: "machine must be local, vm or cloud" }
     input.machine = (body.machine as Bot["machine"] | undefined) ?? existing?.machine ?? "local"
@@ -857,6 +926,12 @@ export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): P
       !validAvatarColor(input.color)
     )
       return { input: null, error: "color must be a six-digit hex color" }
+    if (
+      !existing &&
+      typeof body.instructions === "string" &&
+      (body.instructions.length > 120 * 1024 || Buffer.byteLength(JSON.stringify(body.instructions)) > 120 * 1024)
+    )
+      return { input: null, error: "Bot instructions exceed the 120 KiB limit" }
     if (Object.hasOwn(body, "instructions")) input.instructions = asString(body.instructions, "")
     else if (existing) input.instructions = existing.instructions
     if (Object.hasOwn(body, "model")) input.model = body.model === null ? null : asString(body.model, "")
@@ -951,85 +1026,116 @@ export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): P
     return { input, error: null }
   }
 
-  const createBot = ({ input }: { input: CreateBotInput }): Bot | null => {
+  const createBot = async ({
+    input,
+    signal = new AbortController().signal,
+    isCurrent,
+  }: {
+    input: CreateBotInput
+    signal?: AbortSignal
+    isCurrent?: () => boolean
+  }): Promise<Bot | null> => {
     const id = kernel.newId()
     const instructions = input.instructions ?? ""
     const instructionsHash = sha256(instructions)
-    const homeDir = ensureBotHome({ botId: id, instructions })
+    const homeDir = await writeHome(kernel, id, instructions, signal)
+    const current = isCurrent?.() !== false
+    if (signal.aborted || !current) {
+      await cleanupBotHome(kernel, id)
+      return null
+    }
     const mainThreadId = kernel.newId()
     const timestamp = now()
-    database
-      .query(
-        "INSERT INTO bots (id, name, title, role_line, description, color, avatar_path, avatar_shape, avatar_seed, instructions, instructions_hash, provider, model, reasoning_effort, access, approvals, project_id, cwd, home_dir, main_thread_id, browser_enabled, computer_use, notifications, section, sort_order, paused, source, created_at, updated_at, archived_at) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'failures', NULL, 0, 0, 'local', ?, ?, NULL)",
-      )
-      .run(
-        id,
-        input.name,
-        input.title ?? null,
-        input.roleLine ?? null,
-        input.description ?? null,
-        input.color ?? null,
-        input.avatarShape ?? null,
-        input.avatarSeed ?? null,
-        instructions,
-        instructionsHash,
-        input.provider,
-        input.model ?? null,
-        input.reasoningEffort ?? null,
-        input.access ?? "workspace-write",
-        input.approvals ?? "on-request",
-        input.projectId ?? null,
-        input.cwd ?? null,
-        homeDir,
-        mainThreadId,
-        input.browserEnabled === false ? 0 : 1,
-        input.computerUse === true ? 1 : 0,
-        timestamp,
-        timestamp,
-      )
-    database
-      .query(
-        "UPDATE bots SET machine = ?, machine_idle_minutes = ?, vm_provider_login = ?, host_computer_use = ?, cloud_target = ?, browser = ? WHERE id = ?",
-      )
-      .run(
-        input.machine === "cloud" ? "local" : (input.machine ?? "local"),
-        input.machineIdleMinutes ?? DEFAULT_MACHINE_IDLE_MINUTES,
-        input.vmProviderLogin ? 1 : 0,
-        input.hostComputerUse ? 1 : 0,
-        input.machine === "cloud" ? 1 : 0,
-        input.browser ?? "touri",
-        id,
-      )
-    database
-      .query("UPDATE bots SET folders_json = ?, any_folder_access = ? WHERE id = ?")
-      .run(JSON.stringify(input.folders ?? []), input.anyFolderAccess ? 1 : 0, id)
-    database
-      .query("UPDATE bots SET provider_profile = ?, claude_ai_connectors = ? WHERE id = ?")
-      .run(input.providerProfile ?? null, input.claudeAiConnectors ? 1 : 0, id)
-    database
-      .query(
-        "INSERT INTO threads (id, bot_id, parent_thread_id, kind, title, active_leaf_id, routine_run_id, cwd_override, unread, carryover_note, usage_json, source, created_at, updated_at, archived_at) VALUES (?, ?, NULL, 'main', ?, NULL, NULL, NULL, 0, NULL, ?, 'local', ?, ?, NULL)",
-      )
-      .run(mainThreadId, id, input.name, JSON.stringify(asUsage({})), timestamp, timestamp)
+    try {
+      database.transaction(() => {
+        database
+          .query(
+            "INSERT INTO bots (id, name, title, role_line, description, color, avatar_path, avatar_shape, avatar_seed, instructions, instructions_hash, provider, model, reasoning_effort, access, approvals, project_id, cwd, home_dir, main_thread_id, browser_enabled, computer_use, notifications, section, sort_order, paused, source, created_at, updated_at, archived_at) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'failures', NULL, 0, 0, 'local', ?, ?, NULL)",
+          )
+          .run(
+            id,
+            input.name,
+            input.title ?? null,
+            input.roleLine ?? null,
+            input.description ?? null,
+            input.color ?? null,
+            input.avatarShape ?? null,
+            input.avatarSeed ?? null,
+            instructions,
+            instructionsHash,
+            input.provider,
+            input.model ?? null,
+            input.reasoningEffort ?? null,
+            input.access ?? "workspace-write",
+            input.approvals ?? "on-request",
+            input.projectId ?? null,
+            input.cwd ?? null,
+            homeDir,
+            mainThreadId,
+            input.browserEnabled === false ? 0 : 1,
+            input.computerUse === true ? 1 : 0,
+            timestamp,
+            timestamp,
+          )
+        database
+          .query(
+            "UPDATE bots SET machine = ?, machine_idle_minutes = ?, vm_provider_login = ?, host_computer_use = ?, cloud_target = ?, browser = ? WHERE id = ?",
+          )
+          .run(
+            input.machine === "cloud" ? "local" : (input.machine ?? "local"),
+            input.machineIdleMinutes ?? DEFAULT_MACHINE_IDLE_MINUTES,
+            input.vmProviderLogin ? 1 : 0,
+            input.hostComputerUse ? 1 : 0,
+            input.machine === "cloud" ? 1 : 0,
+            input.browser ?? "touri",
+            id,
+          )
+        database.query("UPDATE bots SET team_builder = ? WHERE id = ?").run(input.jobId === "team-builder" ? 1 : 0, id)
+        database
+          .query("UPDATE bots SET folders_json = ?, any_folder_access = ? WHERE id = ?")
+          .run(JSON.stringify(input.folders ?? []), input.anyFolderAccess ? 1 : 0, id)
+        database
+          .query("UPDATE bots SET provider_profile = ?, claude_ai_connectors = ? WHERE id = ?")
+          .run(input.providerProfile ?? null, input.claudeAiConnectors ? 1 : 0, id)
+        database
+          .query(
+            "INSERT INTO threads (id, bot_id, parent_thread_id, kind, title, active_leaf_id, routine_run_id, cwd_override, unread, carryover_note, usage_json, source, created_at, updated_at, archived_at) VALUES (?, ?, NULL, 'main', ?, NULL, NULL, NULL, 0, NULL, ?, 'local', ?, ?, NULL)",
+          )
+          .run(mainThreadId, id, input.name, JSON.stringify(asUsage({})), timestamp, timestamp)
+      })()
+    } catch (error) {
+      await cleanupBotHome(kernel, id)
+      throw error
+    }
     const bot = getBot({ botId: id })
-    if (bot) {
+    if (!bot) return null
+    try {
       kernel.publish({ type: "bot.updated", bot })
       const thread = getThread({ threadId: mainThreadId })
       if (thread) kernel.publish({ type: "thread.updated", thread })
+    } catch {
+      // Committed bots must stay in the team's result even if live delivery fails.
+      kernel.log({ level: "warn", module: "store", msg: "Bot criado; atualize a lista para vê-lo." })
     }
     return bot
   }
 
-  const patchBot = ({
+  const saveBot = ({
     bot,
     input,
     paused,
+    updateInstructions,
   }: {
     bot: Bot
     input: CreateBotInput
     paused: boolean | undefined
+    updateInstructions?: boolean
   }): Bot | null => {
-    const instructions = input.instructions ?? bot.instructions
+    const stored = database.query("SELECT instructions FROM bots WHERE id = ? AND archived_at IS NULL").get(bot.id) as {
+      instructions: string
+    } | null
+    if (!stored) return null
+    const instructions = updateInstructions ? (input.instructions ?? bot.instructions) : stored.instructions
     const fields: Array<string> = [
       "name = ?",
       "provider = ?",
@@ -1050,6 +1156,7 @@ export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): P
       "browser_enabled = ?",
       "computer_use = ?",
       "updated_at = ?",
+      ...(paused === undefined ? [] : ["paused = ?"]),
     ]
     const values: Array<string | number | null> = [
       input.name,
@@ -1071,33 +1178,45 @@ export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): P
       input.browserEnabled === true ? 1 : 0,
       input.computerUse === true ? 1 : 0,
       now(),
+      ...(paused === undefined ? [] : [paused ? 1 : 0]),
     ]
-    if (paused !== undefined) {
-      fields.push("paused = ?")
-      values.push(paused ? 1 : 0)
-    }
-    database.query(`UPDATE bots SET ${fields.join(", ")} WHERE id = ?`).run(...values, bot.id)
-    database
-      .query(
-        "UPDATE bots SET machine = ?, machine_idle_minutes = ?, vm_provider_login = ?, host_computer_use = ?, cloud_target = ?, browser = ? WHERE id = ?",
-      )
-      .run(
-        input.machine === "cloud" ? "local" : (input.machine ?? bot.machine),
-        input.machineIdleMinutes ?? bot.machineIdleMinutes,
-        input.vmProviderLogin ? 1 : 0,
-        input.hostComputerUse ? 1 : 0,
-        input.machine === "cloud" ? 1 : 0,
-        input.browser ?? bot.browser,
-        bot.id,
-      )
-    database
-      .query("UPDATE bots SET folders_json = ?, any_folder_access = ? WHERE id = ?")
-      .run(JSON.stringify(input.folders ?? []), input.anyFolderAccess ? 1 : 0, bot.id)
-    database
-      .query("UPDATE bots SET provider_profile = ?, claude_ai_connectors = ? WHERE id = ?")
-      .run(input.providerProfile ?? null, input.claudeAiConnectors ? 1 : 0, bot.id)
-    ensureBotHome({ botId: bot.id, instructions })
-    const updated = getBot({ botId: bot.id })
+    const updated = database.transaction(() => {
+      const result = database.query(`UPDATE bots SET ${fields.join(", ")} WHERE id = ?`).run(...values, bot.id)
+      if (!result.changes) return null
+      database
+        .query(
+          "UPDATE bots SET machine = ?, machine_idle_minutes = ?, vm_provider_login = ?, host_computer_use = ?, cloud_target = ?, browser = ? WHERE id = ?",
+        )
+        .run(
+          input.machine === "cloud" ? "local" : (input.machine ?? bot.machine),
+          input.machineIdleMinutes ?? bot.machineIdleMinutes,
+          input.vmProviderLogin ? 1 : 0,
+          input.hostComputerUse ? 1 : 0,
+          input.machine === "cloud" ? 1 : 0,
+          input.browser ?? bot.browser,
+          bot.id,
+        )
+      database
+        .query("UPDATE bots SET folders_json = ?, any_folder_access = ? WHERE id = ?")
+        .run(JSON.stringify(input.folders ?? []), input.anyFolderAccess ? 1 : 0, bot.id)
+      database
+        .query("UPDATE bots SET provider_profile = ?, claude_ai_connectors = ? WHERE id = ?")
+        .run(input.providerProfile ?? null, input.claudeAiConnectors ? 1 : 0, bot.id)
+      return getBot({ botId: bot.id })
+    })()
+    return updated
+  }
+
+  const patchBot = ({
+    bot,
+    input,
+    paused,
+  }: {
+    bot: Bot
+    input: CreateBotInput
+    paused: boolean | undefined
+  }): Bot | null => {
+    const updated = saveBot({ bot, input, paused })
     if (updated) kernel.publish({ type: "bot.updated", bot: updated })
     return updated
   }
@@ -1219,7 +1338,10 @@ export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): P
     appendDelta: streamWriter.appendDelta,
     appendParts: streamWriter.appendParts,
     flushWrites: streamWriter.drain,
+    flushWritesAsync: streamWriter.drainAsync,
+    closeStreamWriterIfIdle: streamWriter.closeIfIdle,
     updateMessage,
+    updateMessageAsync,
     activePath,
     setActiveLeaf,
     getBot,
@@ -1233,7 +1355,26 @@ export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): P
   kernel.services.provide("store.api", storeApi)
   kernel.services.provide("store.settings", () => readSettings({ database }))
 
-  const handleCreateBot = async ({ body }: { body: unknown }): Promise<RouteResponse> => {
+  kernel.services.provide("bots.validateCreation", (body) => {
+    const record = requestRecord(body)
+    if (!record) return { success: false, errorCode: "INVALID_ARGS", error: "Request body must be an object" }
+    const parsed = botFromBody({ body: record })
+    if (!parsed.input || parsed.error)
+      return { success: false, errorCode: parsed.errorCode ?? "INVALID_ARGS", error: parsed.error ?? "Invalid bot" }
+    return { success: true, input: parsed.input }
+  })
+  kernel.services.provide("bots.create", async ({ body, signal, isCurrent }) => {
+    const parsed = kernel.services.use("bots.validateCreation")?.(body)
+    if (!parsed?.success) return parsed ?? { success: false, errorCode: "STORE_ERROR", error: "Store unavailable" }
+    // This internal service is only for safe local drafts; POST /bots handles other user-selected destinations.
+    if (parsed.input.machine !== "local" || parsed.input.jobId)
+      return { success: false, errorCode: "INVALID_ARGS", error: "Invalid team bot destination or job" }
+    const bot = await createBot({ input: parsed.input, signal, ...(isCurrent ? { isCurrent } : {}) })
+    return bot
+      ? { success: true, bot }
+      : { success: false, errorCode: "STORE_ERROR", error: "Bot could not be created" }
+  })
+  const handleCreateBot = async ({ body, signal }: { body: unknown; signal: AbortSignal }): Promise<RouteResponse> => {
     const record = requestRecord(body)
     if (!record) return errorResponse(400, "INVALID_ARGS", "Request body must be an object")
     await refreshHostFolderAccess()
@@ -1242,7 +1383,7 @@ export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): P
       return errorResponse(400, parsed.errorCode ?? "INVALID_ARGS", parsed.error ?? "Invalid bot")
     if (parsed.input.machine === "cloud" && !(await kernel.services.use("cloud.account")?.connected()))
       return errorResponse(401, "TOURI-E9001", "Conecte sua conta")
-    const bot = createBot({ input: parsed.input })
+    const bot = await createBot({ input: parsed.input, signal })
     if (bot?.machine === "cloud") {
       try {
         await kernel.services
@@ -1263,7 +1404,7 @@ export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): P
         method: "GET",
         path: "/workspace/activity",
         handler: async () => {
-          flushDeltas()
+          await drainForGlobalRead()
           const { messages, runs } = readWorkspaceActivity(database)
           return jsonResponse(200, { messages: messages.map(asMessage), runs })
         },
@@ -1287,11 +1428,11 @@ export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): P
           return jsonResponse(200, { bots: rows.map(asBot) })
         },
       },
-      { method: "POST", path: "/bots", handler: async ({ body }) => handleCreateBot({ body }) },
+      { method: "POST", path: "/bots", handler: async ({ body, signal }) => handleCreateBot({ body, signal }) },
       {
         method: "PATCH",
         path: "/bots/:id",
-        handler: async ({ params, body }) => {
+        handler: async ({ params, body, signal }) => {
           await refreshHostFolderAccess()
           const bot = getBot({ botId: params.id ?? "" })
           if (!bot) return errorResponse(404, "NOT_FOUND", "Bot not found")
@@ -1303,29 +1444,68 @@ export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): P
           })
           if (!parsed.input || parsed.error)
             return errorResponse(400, parsed.errorCode ?? "INVALID_ARGS", parsed.error ?? "Invalid bot")
+          const input = parsed.input
           if (record.paused !== undefined && typeof record.paused !== "boolean")
             return errorResponse(400, "INVALID_ARGS", "paused must be a boolean")
           const machineRow = database.query("SELECT project_id FROM bot_machines WHERE bot_id = ?").get(bot.id) as {
             project_id: string | null
           } | null
-          if (machineRow?.project_id && parsed.input.projectId !== bot.projectId)
+          if (machineRow?.project_id && input.projectId !== bot.projectId)
             return errorResponse(
               409,
               "MACHINE_PROJECT_CHANGE",
               "Recrie a máquina do zero antes de trocar o projeto; o volume atual foi preservado",
             )
-          if (
-            parsed.input.machine !== bot.machine ||
-            parsed.input.provider !== bot.provider ||
-            parsed.input.projectId !== bot.projectId
-          ) {
+          const mustStopVm =
+            input.machine !== bot.machine || input.provider !== bot.provider || input.projectId !== bot.projectId
+          if (mustStopVm) {
             try {
               await kernel.services.use("vm.runtime")?.stop({ botId: bot.id })
             } catch (error) {
               return errorResponse(409, "MACHINE_BUSY", String(error))
             }
           }
-          const updated = patchBot({ bot, input: parsed.input, paused: record.paused as boolean | undefined })
+          let updated: Bot | null
+          if (Object.hasOwn(record, "instructions")) {
+            let committedBot: Bot | null = null
+            const instructions = input.instructions ?? bot.instructions
+            const editError = await writeEditedHome(kernel, bot.id, instructions, signal, () => {
+              const currentBot = getBot({ botId: bot.id })
+              if (!currentBot) throw new Error("Bot could not be updated")
+              return {
+                commit: () => {
+                  const latestBot = getBot({ botId: bot.id })
+                  if (!latestBot) throw new Error("Bot could not be updated")
+                  const latest = botFromBody({
+                    body: { ...record, provider: record.provider ?? latestBot.provider },
+                    existing: latestBot,
+                  })
+                  if (!latest.input || latest.error) throw new Error(latest.error ?? "Invalid bot")
+                  const machineChanged =
+                    latest.input.machine !== latestBot.machine ||
+                    latest.input.provider !== latestBot.provider ||
+                    latest.input.projectId !== latestBot.projectId
+                  if (machineChanged && !mustStopVm)
+                    throw new Error("Bot configuration changed during the instruction edit")
+                  committedBot = saveBot({
+                    bot: latestBot,
+                    input: latest.input,
+                    paused: record.paused as boolean | undefined,
+                    updateInstructions: true,
+                  })
+                  if (!committedBot) throw new Error("Bot could not be updated")
+                },
+              }
+            }).then(
+              () => null,
+              () => errorResponse(409, "BOT_EDIT_FAILED", "Não foi possível salvar as instruções. Tente novamente."),
+            )
+            if (editError) return editError
+            updated = committedBot
+            if (updated) kernel.publish({ type: "bot.updated", bot: updated })
+          } else {
+            updated = patchBot({ bot, input, paused: record.paused as boolean | undefined })
+          }
           return updated
             ? jsonResponse(200, { bot: updated })
             : errorResponse(500, "STORE_ERROR", "Bot could not be updated")
@@ -1419,7 +1599,7 @@ export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): P
               await cloud.request("GET", `/v1/threads/${encodeURIComponent(cloudThread.id)}/transcript${suffix}`),
             )
           }
-          flushDeltas()
+          await streamWriter.drainAsync({ threadId: params.id ?? "" })
           const thread = getThread({ threadId: params.id ?? "" })
           if (!thread) return errorResponse(404, "NOT_FOUND", "Conversa não encontrada")
           const since = Number(query.since ?? 0)
@@ -1433,7 +1613,13 @@ export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): P
           // revisions must not look like an empty, up-to-date transcript.
           const resync =
             historyThreadPending(database, thread.id) ||
-            since < (floor?.through_seq ?? 0) ||
+            getTranscriptRetentionResync({
+              database,
+              threadId: thread.id,
+              since,
+              floor: floor?.through_seq ?? 0,
+              lastSeq: thread.updatedSeq ?? 0,
+            }) ||
             since > (thread.updatedSeq ?? 0)
           const rows = database
             .query(
@@ -1473,7 +1659,7 @@ export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): P
               await cloud.request("GET", `/v1/threads/${encodeURIComponent(cloudThread.id)}/messages${suffix}`),
             )
           }
-          flushDeltas()
+          await streamWriter.drainAsync({ threadId: params.id ?? "" })
           const thread = getThread({ threadId: params.id ?? "" })
           if (!thread) return errorResponse(404, "NOT_FOUND", "Thread not found")
           const messages =
@@ -1512,10 +1698,14 @@ export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): P
         method: "GET",
         path: "/search",
         handler: async ({ query }) => {
-          const hits =
-            query.botId === undefined
-              ? search({ q: query.q ?? "", limit: 50 })
-              : search({ q: query.q ?? "", botId: query.botId, limit: 50 })
+          if (query.threadId === undefined) await drainForGlobalRead()
+          else await streamWriter.drainAsync({ threadId: query.threadId })
+          const hits = search({
+            q: query.q ?? "",
+            ...(query.botId === undefined ? {} : { botId: query.botId }),
+            ...(query.threadId === undefined ? {} : { threadId: query.threadId }),
+            limit: 50,
+          })
           return jsonResponse(200, { hits })
         },
       },

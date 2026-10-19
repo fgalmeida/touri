@@ -113,7 +113,7 @@ const runServe = async (): Promise<void> => {
       await runtime.kernel.services.use("runtime.shutdown")?.()
       runtime.emitHostNotification({ method: "app.willQuit", params: {} })
       await runtime.kernel.services.use("vm.shutdown")?.()
-      runtime.stop()
+      await runtime.stop()
       lease.release()
       process.exit(0)
     })().catch((error) => {
@@ -257,6 +257,15 @@ const usage = (): void => {
 
 const main = async (): Promise<void> => {
   const [mode = "serve", ...rest] = process.argv.slice(2)
+  if (mode === "write-bot-home") {
+    const { runBotHomeWriter } = await import("./store/bot-home")
+    try {
+      await runBotHomeWriter(createAppPaths().appData)
+    } catch {
+      process.exitCode = 1
+    }
+    return
+  }
   if (mode === "serve") {
     await runServe()
     return

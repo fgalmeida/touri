@@ -31,9 +31,10 @@ import { approvalOutcome } from "../approvals/outcome"
 import { delegatedBot } from "../groups/security"
 import { createGroupStore } from "../groups/store"
 import { buildChildEnv } from "../kernel"
+import { writeDatabaseAsync } from "../kernel/database-write"
 import { folderAccessUnavailable, folderGrantProblem, refreshHostFolderAccess } from "../kernel/folder-capability"
 import { hasPathHistory } from "../kernel/message-path"
-import type { PerformanceStageRunner } from "../kernel/performance"
+import type { PerformanceStage, PerformanceStageRunner } from "../kernel/performance"
 import { providerProfileEnv } from "../kernel/provider-profiles"
 import { redactStructured } from "../kernel/redact"
 import { attachedServers, resolveAttachedMcp } from "../mcp/attached"
@@ -82,11 +83,13 @@ import { createWorkState, type WorkState } from "./work-state"
 
 type RunState = {
   replyParentId?: Id | undefined
+  requestMessage: Message | null
   text: string
   pendingText: Array<string>
   pendingPartText: Map<number, { type: "text" | "reasoning"; chunks: Array<string> }>
   textItemIds: Set<string>
   parts: Array<MessagePart>
+  partIndices: Map<string, number>
   dirtyParts: Set<number>
   replyMessageId: Id | null
   turnStarted: boolean
@@ -101,6 +104,8 @@ type RunState = {
   fingerprint: string | null
   continueAfterApproval: boolean
   outputTimer: ReturnType<typeof setTimeout> | null
+  partPublishImmediate: ReturnType<typeof setImmediate> | null
+  lastEventLivenessCheckAt: number
   lastOutputPublishedAt: number
 }
 
@@ -113,6 +118,8 @@ const appendPendingText = (state: RunState, partIndex: number, type: "text" | "r
   state.pendingPartText.set(partIndex, pending)
   if (type === "text") state.pendingText.push(delta)
 }
+
+const getPartKey = (part: MessagePart): string | null => ("callId" in part ? `${part.type}\u0000${part.callId}` : null)
 
 const materializePartText = (state: RunState, partIndex: number, runStage?: PerformanceStageRunner): void => {
   const pending = state.pendingPartText.get(partIndex)
@@ -148,6 +155,7 @@ const materializePendingText = (state: RunState, runStage?: PerformanceStageRunn
 type PendingApproval = { runId: Id; provider: ProviderAdapter; providerApprovalId: Id }
 
 const ROUTINE_TICK_GRACE_MS = 2 * 60_000
+const EVENT_LIVENESS_CHECK_INTERVAL_MS = 50
 
 type RoutineCreate = {
   botId: Id
@@ -180,7 +188,8 @@ type RuntimeEngine = {
     trigger: RunTrigger
     routineRunId?: Id
     delegated?: boolean
-  }) => Result<{ run: Run }, "THREAD_NOT_FOUND" | "BOT_PAUSED">
+    continuing?: boolean
+  }) => Result<{ run: Run }, "THREAD_NOT_FOUND" | "BOT_PAUSED" | "RUNTIME_DRAINING">
   getRunSnapshot: (run: Run) => Run
   getWorkRuns: () => Array<Run>
   settingsChanged: () => void
@@ -190,7 +199,9 @@ type RuntimeEngine = {
   cancel: (id: Id) => Result<{ run: Run }, "NOT_FOUND">
   cancelRuns: (runIds: Id[]) => Promise<void>
   cancelBotTurns: (args: { botId: Id }) => Promise<void>
-  retry: (id: Id) => Result<{ run: Run }, "NOT_FOUND" | "THREAD_NOT_FOUND" | "BOT_PAUSED" | "CONFLICT">
+  retry: (
+    id: Id,
+  ) => Result<{ run: Run }, "NOT_FOUND" | "THREAD_NOT_FOUND" | "BOT_PAUSED" | "CONFLICT" | "RUNTIME_DRAINING">
   answerApproval: (args: {
     approvalId: Id
     decision: "approved" | "denied"
@@ -225,9 +236,11 @@ type RuntimeEngine = {
     scheduledFor?: number
   }) => Result<
     { routineRun: RoutineRun },
-    "NOT_FOUND" | "INVALID_ARGS" | "THREAD_NOT_FOUND" | "BOT_PAUSED" | "DELEGATION_LIMIT"
+    "NOT_FOUND" | "INVALID_ARGS" | "THREAD_NOT_FOUND" | "BOT_PAUSED" | "DELEGATION_LIMIT" | "RUNTIME_DRAINING"
   >
   tick: (now?: number) => Promise<void>
+  beginDrain: () => void
+  waitForDrain: () => Promise<void>
   shutdown: () => Promise<void>
 }
 
@@ -236,6 +249,8 @@ const statusForError = (errorClass: RunErrorClass): RunStatus => {
   if (errorClass === "app_restart") return "interrupted"
   return "failed"
 }
+
+const DRAIN_CHANGE_TIMEOUT_MS = 1_000
 
 const initialUsage = (): RunUsage => ({
   inputTokens: 0,
@@ -310,6 +325,7 @@ export const createRuntimeEngine = ({
     }
   }
   let queued: Array<Id> = persistence.listQueuedRuns().map((run) => run.id)
+  let draining = false
   let shuttingDown = false
   let shutdownPromise: Promise<void> | null = null
   const tools = createToolResolutions(kernel)
@@ -319,8 +335,17 @@ export const createRuntimeEngine = ({
   const providers = new Map<Id, ProviderAdapter>()
   const states = new Map<Id, RunState>()
   const pendingApprovals = new Map<Id, PendingApproval>()
+  let drainChange = Promise.withResolvers<void>()
+  const signalDrainChange = (): void => {
+    const previous = drainChange
+    drainChange = Promise.withResolvers<void>()
+    previous.resolve()
+  }
+  const measureStage = <Value>(stage: PerformanceStage, action: () => Value): Value =>
+    runStage ? runStage(stage, action) : action()
   const codexOptions = {
     kernel,
+    ...(runStage ? { runStage } : {}),
     ...(codexCommand ? { command: codexCommand } : {}),
     ...(interruptGraceMs === undefined ? {} : { interruptGraceMs }),
   }
@@ -351,7 +376,7 @@ export const createRuntimeEngine = ({
   const notices = createRuntimeNotices({ kernel })
   const work: WorkState = createWorkState({ database: kernel.db as Database })
   const continuations = createRunContinuations({ database: kernel.db })
-  const pendingContinuations = new Map<Id, { timer: ReturnType<typeof setTimeout>; run: Run }>()
+  const pendingContinuations = new Map<Id, { timer: ReturnType<typeof setTimeout>; run: Run; plan: ContinuationPlan }>()
   const goalDeadlines = new Map<Id, ReturnType<typeof startGoalDeadline>>()
   const getGoalNow = goalDeadlineClock?.now ?? Date.now
   const goals = createGoalRuntime(
@@ -365,7 +390,7 @@ export const createRuntimeEngine = ({
         cancel(runId)
       },
       getRuns: persistence.listRuns,
-      isStopping: () => shuttingDown,
+      isStopping: () => shuttingDown || draining,
       onSaved: (goal) => {
         if (goal.runId) goalDeadlines.get(goal.runId)?.setDeadline(goal.deadlineAt)
       },
@@ -436,9 +461,13 @@ export const createRuntimeEngine = ({
     }
   }
   const getRunSnapshot = (run: Run): Run => getSnapshot(run, getQueueSnapshot())
-  const publishRun = (run: Run): void => kernel.publish({ type: "run.updated", run: getRunSnapshot(run) })
+  const publishRun = (run: Run): void => {
+    signalDrainChange()
+    kernel.publish({ type: "run.updated", run: getRunSnapshot(run) })
+  }
   const publishQueue = (): void => {
     const queue = getQueueSnapshot()
+    signalDrainChange()
     queue.waiting.forEach((run) => {
       kernel.publish({ type: "run.updated", run: getSnapshot(run, queue) })
     })
@@ -468,17 +497,38 @@ export const createRuntimeEngine = ({
     return stored !== null && ["queued", "starting", "running"].includes(stored.status)
   }
 
-  const finishLiveRun = (run: Run, finish: () => void): void => {
+  const isLiveForEvent = (run: Run, state: RunState): boolean => {
+    const now = performance.now()
+    if (now - state.lastEventLivenessCheckAt < EVENT_LIVENESS_CHECK_INTERVAL_MS) return true
+
+    // Provider frames arrive in bursts; a short lease avoids synchronous disk and SQLite reads per frame.
+    state.lastEventLivenessCheckAt = now
+    return isLive(run)
+  }
+
+  const finishLiveRun = async (run: Run, finish: () => void, messageId?: Id): Promise<void> => {
     // Accepted streaming work survives even if the final transaction rolls back.
-    kernel.services.use("store.api")?.flushWrites?.()
+    try {
+      await measureStage("runtime_stream_flush", () =>
+        kernel.services.use("store.api")?.flushWritesAsync?.({
+          threadId: run.threadId,
+          ...(messageId ? { messageId } : {}),
+        }),
+      )
+    } catch {
+      // A failed stream drain must not leave its run active or prevent terminal state.
+    }
     const write = (): void => {
-      if (!isLive(run)) return
+      if (!isLive(run)) {
+        tools.clearPendingMemory(run.id)
+        return
+      }
 
       finish()
       tools.clearPending(run.id)
     }
     // The terminal reply, run and tool resolutions have one winning writer.
-    if (kernel.db instanceof Database) kernel.db.transaction(write)()
+    if (kernel.db instanceof Database) await writeDatabaseAsync(kernel.db, write)
     else write()
   }
 
@@ -491,8 +541,10 @@ export const createRuntimeEngine = ({
       pendingPartText: new Map(),
       textItemIds: new Set(),
       parts: [],
+      partIndices: new Map(),
       dirtyParts: new Set(),
       replyMessageId: null,
+      requestMessage: null,
       turnStarted: false,
       externalSessionId: null,
       rolloutPath: null,
@@ -505,6 +557,8 @@ export const createRuntimeEngine = ({
       fingerprint: null,
       continueAfterApproval: false,
       outputTimer: null,
+      partPublishImmediate: null,
+      lastEventLivenessCheckAt: Number.NEGATIVE_INFINITY,
       lastOutputPublishedAt: 0,
     }
     states.set(runId, created)
@@ -548,7 +602,7 @@ export const createRuntimeEngine = ({
     persistence.saveRun(run)
   }
 
-  const publishMessage = ({
+  const publishMessageNow = ({
     store,
     state,
     run,
@@ -561,49 +615,108 @@ export const createRuntimeEngine = ({
   }): void => {
     if (state.outputTimer) clearTimeout(state.outputTimer)
     state.outputTimer = null
+    if (state.partPublishImmediate) clearImmediate(state.partPublishImmediate)
+    state.partPublishImmediate = null
     state.lastOutputPublishedAt = Date.now()
     if (status === "streaming" && !state.cancelRequested)
-      state.dirtyParts.forEach((partIndex) => {
-        materializePartText(state, partIndex, runStage)
-      })
+      [...state.dirtyParts]
+        .sort((left, right) => left - right)
+        .forEach((partIndex) => {
+          materializePartText(state, partIndex, runStage)
+        })
     else materializePendingText(state, runStage)
-    if (state.cancelRequested) {
-      state.parts = tools.finish(run, state.parts, "cancelled_by_user")
-      for (let index = 0; index < state.parts.length; index++) state.dirtyParts.add(index)
-    }
-    if (status === "streaming" && store.appendParts) {
-      const parts = [...state.dirtyParts]
-        .sort((a, b) => a - b)
-        .flatMap((partIndex) => {
+    const partIndices = [...state.dirtyParts].sort((left, right) => left - right)
+    const messageId = state.replyMessageId
+    if (status === "streaming" && !messageId) return
+    if (store.appendParts && status === "streaming") {
+      if (!messageId) return
+      const parts = measureStage("runtime_part_preparation", () =>
+        partIndices.flatMap((partIndex) => {
           const part = state.parts[partIndex]
           if (!part) return []
           return [{ partIndex, part: "callId" in part ? tools.record(run, part, false, false) : part }]
-        })
-      if (!state.replyMessageId || !parts.length) return
-      store.appendParts({
-        threadId: run.threadId,
-        messageId: state.replyMessageId,
-        parts,
-        ...(state.generation === null ? {} : { generation: state.generation }),
+        }),
+      )
+      if (parts.length) {
+        measureStage("runtime_part_append", () =>
+          store.appendParts?.({
+            threadId: run.threadId,
+            messageId,
+            parts,
+            ...(state.generation === null ? {} : { generation: state.generation }),
+          }),
+        )
+        // The store can replace completed output with a durable attachment reference.
+        for (const patch of parts) state.parts[patch.partIndex] = patch.part
+        // Consent must be durable and visible before the approved action can proceed.
+        if (parts.some(({ part }) => part.type === "approval"))
+          measureStage("runtime_stream_flush", () => store.flushWrites?.())
+      }
+      partIndices.forEach((partIndex) => {
+        state.dirtyParts.delete(partIndex)
       })
-      // The store can replace completed output with a durable attachment reference.
-      for (const patch of parts) state.parts[patch.partIndex] = patch.part
-      // Consent must be durable and visible before the approved action can proceed.
-      if (parts.some(({ part }) => part.type === "approval")) store.flushWrites?.()
-      state.dirtyParts.clear()
       return
     }
-    state.parts = state.parts.map((part) => ("callId" in part ? tools.record(run, part) : part))
-    if (!state.replyMessageId) return
-    const updated = store.updateMessage({
-      threadId: run.threadId,
-      messageId: state.replyMessageId,
-      patch: { status, parts: state.parts, text: state.text, runId: run.id },
-    })
+    if (!messageId) return
+    const updated = measureStage("runtime_terminal_message_update", () =>
+      store.updateMessage({
+        threadId: run.threadId,
+        messageId,
+        patch: { status, parts: state.parts, text: state.text, runId: run.id },
+      }),
+    )
     if (updated.success) {
       state.parts = structuredClone(updated.message.parts)
       state.dirtyParts.clear()
     }
+  }
+
+  const finishParts = ({
+    run,
+    state,
+    reason,
+    persist = true,
+  }: {
+    run: Run
+    state: RunState
+    reason: "cancelled_by_user" | "failed" | "interrupted_by_restart" | "unknown"
+    persist?: boolean
+  }): void => {
+    measureStage("runtime_part_finalization", () => {
+      const parts = tools.finish(run, state.parts, reason, persist)
+      parts.forEach((part, index) => {
+        const previous = state.parts[index]
+        const entries = Object.entries(part)
+        const changed =
+          !previous ||
+          entries.length !== Object.keys(previous).length ||
+          entries.some(([key, value]) => Reflect.get(previous, key) !== value)
+        if (changed) state.dirtyParts.add(index)
+      })
+      state.parts = parts
+    })
+  }
+
+  const publishMessage = (args: { store: StoreApi; state: RunState; run: Run; status: Message["status"] }): void => {
+    if (runStage) runStage("runtime_message_publish", publishMessageNow, args)
+    else publishMessageNow(args)
+  }
+
+  const flushPendingPartPublish = ({ store, state, run }: { store: StoreApi; state: RunState; run: Run }): void => {
+    if (state.partPublishImmediate === null) return
+    clearImmediate(state.partPublishImmediate)
+    state.partPublishImmediate = null
+    if (shuttingDown || !isLiveForEvent(run, state)) return
+    publishMessage({ store, state, run, status: "streaming" })
+  }
+
+  const schedulePartPublish = ({ store, state, run }: { store: StoreApi; state: RunState; run: Run }): void => {
+    if (state.partPublishImmediate !== null) return
+    state.partPublishImmediate = setImmediate(() => {
+      state.partPublishImmediate = null
+      if (shuttingDown || !isLiveForEvent(run, state)) return
+      publishMessage({ store, state, run, status: "streaming" })
+    })
   }
 
   const notice = ({
@@ -672,7 +785,7 @@ export const createRuntimeEngine = ({
   }): void => {
     if (shuttingDown) return
     // A newer runtime may have fenced this writer during restart recovery.
-    if (!isLive(run)) {
+    if (!isLiveForEvent(run, state)) {
       controllers.get(run.id)?.abort()
       return
     }
@@ -721,8 +834,7 @@ export const createRuntimeEngine = ({
     if (event.type === "text_delta") {
       if (!event.delta) return
       if (!state.replyMessageId) {
-        const thread = store.getThread({ threadId: run.threadId })
-        const request = run.requestMessageId && thread ? getActivePathMessage({ store, run }) : null
+        const request = state.requestMessage
         if (request) ensureReply({ run, state, store, parentId: request.id })
       }
       // Provider items are separate Markdown documents; chunks within an item are not.
@@ -734,9 +846,11 @@ export const createRuntimeEngine = ({
       const delta = separator + event.delta
       const existing = last?.type === "text" ? last : undefined
       const partIndex = existing ? state.parts.length - 1 : state.parts.length
+      if (state.replyMessageId) flushPendingPartPublish({ store, state, run })
       if (!existing) state.parts.push({ type: "text", text: "" })
+      if (state.cancelRequested) state.dirtyParts.add(partIndex)
       appendPendingText(state, partIndex, "text", delta)
-      if (state.replyMessageId)
+      if (state.replyMessageId) {
         store.appendDelta({
           threadId: run.threadId,
           messageId: state.replyMessageId,
@@ -744,6 +858,7 @@ export const createRuntimeEngine = ({
           delta,
           ...(state.generation === null ? {} : { generation: state.generation }),
         })
+      }
       return
     }
     if (event.type === "reasoning_delta" || event.type === "reasoning_progress") {
@@ -757,9 +872,9 @@ export const createRuntimeEngine = ({
         else state.parts.push(part)
         state.dirtyParts.add(partIndex)
       } else {
-        if (last?.type !== "reasoning") state.parts.push({ type: "reasoning", text: "" })
-        appendPendingText(state, partIndex, "reasoning", event.delta)
         if (last?.type === "reasoning" && state.replyMessageId) {
+          flushPendingPartPublish({ store, state, run })
+          appendPendingText(state, partIndex, "reasoning", event.delta)
           store.appendDelta({
             threadId: run.threadId,
             messageId: state.replyMessageId,
@@ -769,11 +884,13 @@ export const createRuntimeEngine = ({
           })
           return
         }
+        if (last?.type !== "reasoning") state.parts.push({ type: "reasoning", text: "" })
+        appendPendingText(state, partIndex, "reasoning", event.delta)
         state.dirtyParts.add(partIndex)
       }
       if (state.replyMessageId) publishMessage({ store, state, run, status: "streaming" })
       else {
-        const request = getActivePathMessage({ store, run })
+        const request = state.requestMessage
         if (request) ensureReply({ run, state, store, parentId: request.id })
       }
       return
@@ -791,12 +908,8 @@ export const createRuntimeEngine = ({
         (part.type === "tool_call" && part.ok === null && part.outputTail !== undefined)
       )
         part.outputTail = commandOutputTail(part.outputTail ?? "")
-      const index =
-        "callId" in part
-          ? state.parts.findIndex(
-              (candidate) => "callId" in candidate && candidate.callId === part.callId && candidate.type === part.type,
-            )
-          : -1
+      const key = getPartKey(part)
+      const index = key ? (state.partIndices.get(key) ?? -1) : -1
       const previous = state.parts[index]
       if (previous?.type === "tool_call" && part.type === "tool_call") {
         state.parts[index] = {
@@ -822,12 +935,23 @@ export const createRuntimeEngine = ({
       } else if (index >= 0) state.parts[index] = part
       else {
         state.parts.push(part)
+        if (key) state.partIndices.set(key, state.parts.length - 1)
         if (part.type === "tool_call") state.usage.toolCalls += 1
       }
-      state.dirtyParts.add(index >= 0 ? index : state.parts.length - 1)
+      const changedPartIndex = index >= 0 ? index : state.parts.length - 1
+      state.dirtyParts.add(changedPartIndex)
+      const changedPart = state.parts[changedPartIndex]
+      if (state.cancelRequested && changedPart && "callId" in changedPart) {
+        const pending =
+          (changedPart.type === "tool_call" && changedPart.ok === null) ||
+          (changedPart.type === "command" && changedPart.exitCode === null)
+        state.parts[changedPartIndex] = tools.record(
+          run,
+          pending ? { ...changedPart, resolution: "cancelled_by_user", resolvedAt: Date.now() } : changedPart,
+        )
+      }
       if (!state.replyMessageId) {
-        const thread = store.getThread({ threadId: run.threadId })
-        const request = run.requestMessageId && thread ? getActivePathMessage({ store, run }) : null
+        const request = state.requestMessage
         if (request) ensureReply({ run, state, store, parentId: request.id })
       }
       const liveOutput =
@@ -842,7 +966,7 @@ export const createRuntimeEngine = ({
         }, remaining)
         return
       }
-      publishMessage({ store, state, run, status: "streaming" })
+      schedulePartPublish({ store, state, run })
       return
     }
     if (event.type === "approval_request") {
@@ -895,8 +1019,7 @@ export const createRuntimeEngine = ({
         scope: event.part.scope,
       })
       if (!state.replyMessageId) {
-        const thread = store.getThread({ threadId: run.threadId })
-        const request = run.requestMessageId && thread ? getActivePathMessage({ store, run }) : null
+        const request = state.requestMessage
         if (request) ensureReply({ run, state, store, parentId: request.id })
       }
       pendingApprovals.set(approvalId, {
@@ -917,12 +1040,18 @@ export const createRuntimeEngine = ({
   }
 
   const getActivePathMessage = ({ store, run }: { store: StoreApi; run: Run }): Message | null => {
-    if (!run.requestMessageId) return null
-    if (store.getPathMessage) return store.getPathMessage({ threadId: run.threadId, messageId: run.requestMessageId })
+    const requestMessageId = run.requestMessageId
+    if (!requestMessageId) return null
 
-    return store.activePath({ threadId: run.threadId }).find((message) => message.id === run.requestMessageId) ?? null
+    const getRequestFromActivePath = () =>
+      store.getPathMessage
+        ? store.getPathMessage({ threadId: run.threadId, messageId: requestMessageId })
+        : (store.activePath({ threadId: run.threadId }).find((message) => message.id === requestMessageId) ?? null)
+
+    return runStage ? runStage("runtime_request_path_lookup", getRequestFromActivePath) : getRequestFromActivePath()
   }
 
+  // Group coordination envelopes use the system role; failed member attempts alone leave no conversation to restore.
   const hasPreviousMessages = (store: StoreApi, thread: Thread, requestId: string | null): boolean => {
     if (store.getPathMessage && kernel.db instanceof Database && thread.activeLeafId)
       return hasPathHistory(kernel.db, thread.id, thread.activeLeafId, requestId)
@@ -1067,6 +1196,8 @@ export const createRuntimeEngine = ({
         }) ?? undefined
     }
     const request = getActivePathMessage({ store, run })
+    // A branch switch during startup may move the visible leaf back when the first reply arrives.
+    state.requestMessage = request
     const resumedFrom = request?.role === "system" ? continuationReasonOf(request.text) : null
     const link = continuations.link(run.id)
     const originalRun = link ? persistence.getRun(link.originalRunId) : null
@@ -1341,7 +1472,8 @@ export const createRuntimeEngine = ({
         flushEvents = safeEvents.flush
         // VM preparation registers its credentials with the same live registry.
         // Keep a single stream boundary for native and guest turns, before storage.
-        const onEvent = safeEvents
+        const onEvent = (event: ProviderEvent) =>
+          runStage ? runStage("provider_event_redaction", safeEvents, event) : safeEvents(event)
         const startTurn: ProviderAdapter["startTurn"] = prepared
           ? (args) => startVmTurn({ kernel, provider, args })
           : provider.startTurn
@@ -1414,119 +1546,138 @@ export const createRuntimeEngine = ({
         if (deadline) clearTimeout(deadline)
       }
     })()
-    approvalBridge.cancelRun(run.id)
-    for (const [approvalId, approval] of pendingApprovals) {
-      if (approval.runId !== run.id) continue
-      pendingApprovals.delete(approvalId)
-      notices.resolve({ requestId: approvalId, resolution: "expired" })
-      const part = state.parts.find((part) => part.type === "approval" && part.approvalId === approvalId)
-      if (part?.type === "approval") {
-        part.decision = "expired"
-        part.resolvedAt = Date.now()
-      }
-    }
-    if (!isLive(run)) {
-      active.delete(run.threadId)
-      controllers.delete(run.id)
-      providers.delete(run.id)
-      void drain()
-      return
-    }
-    const elapsed = Date.now() - (run.startedAt ?? Date.now())
-    state.usage.durationMs = elapsed
-    if (result.success) {
-      state.externalSessionId = state.externalSessionId ?? result.externalSessionId
-      state.rolloutPath = state.rolloutPath ?? result.rolloutPath
-      const sessionRow = persistence.getActiveSession({ threadId: thread.id, provider: bot.provider }) ??
-        session ?? {
-          id: kernel.newId(),
-          threadId: thread.id,
-          provider: bot.provider,
-          externalSessionId: state.externalSessionId,
-          rolloutPath: state.rolloutPath,
-          fingerprint: mcpFingerprint.hash,
-          state: "active",
-          model: bot.model,
-          createdAt: Date.now(),
-          lastUsedAt: Date.now(),
+    const finalizeProviderTurn = async (): Promise<void> => {
+      approvalBridge.cancelRun(run.id)
+      for (const [approvalId, approval] of pendingApprovals) {
+        if (approval.runId !== run.id) continue
+        pendingApprovals.delete(approvalId)
+        notices.resolve({ requestId: approvalId, resolution: "expired" })
+        const approvalIndex = state.parts.findIndex(
+          (part) => part.type === "approval" && part.approvalId === approvalId,
+        )
+        const part = state.parts[approvalIndex]
+        if (part?.type === "approval") {
+          part.decision = "expired"
+          part.resolvedAt = Date.now()
+          state.dirtyParts.add(approvalIndex)
         }
-      persistence.saveSession({
-        ...sessionRow,
-        externalSessionId: state.externalSessionId,
-        rolloutPath: state.rolloutPath,
-        fingerprint: mcpFingerprint.hash,
-        state: "active",
-        lastUsedAt: Date.now(),
-      })
-      const providerErrorClass = state.cancelRequested
-        ? "canceled"
-        : (state.completionError?.errorClass ?? (result.status === "succeeded" ? null : "cli_crash"))
-      const workRoot = providerErrorClass ? null : work.publishRoot({ turnId: run.id })
-      const errorClass = workRoot && !workRoot.success ? "tool_error" : providerErrorClass
-      if (!errorClass) {
-        const plan = state.continueAfterApproval
-          ? planContinuation({ run, reason: "permission_granted", lastActivityAt: Date.now() })
-          : null
-        state.continueAfterApproval = false
-        finishLiveRun(run, () => {
-          ensureReply({ run, state, store, parentId: run.requestMessageId ?? thread.activeLeafId ?? run.id })
-          state.parts = tools.finish(run, state.parts, "unknown")
-          const conclusion = turnConclusion({
-            parts: state.parts,
-            requestText: (originalRequest ?? request)?.text ?? "",
-            pendingPartText: state.pendingPartText,
-          })
-          if (conclusion)
-            handleEvent({ run, store, state, event: { type: "text_delta", itemId: kernel.newId(), delta: conclusion } })
-          publishMessage({ store, state, run, status: "complete" })
-          updateRun(run, {
-            status: "succeeded",
-            errorClass: null,
-            errorMessage: null,
-            usage: state.usage,
-            finishedAt: Date.now(),
-          })
-          if (plan) scheduleContinuation({ run, plan })
-          else {
-            if (remembers && request)
-              mem0?.sync({ botId: bot.id, threadId: thread.id, userText: request.text, assistantText: state.text })
-            finishRoutineRun({ run, state, status: "succeeded" })
-            if (goals.getForRun(run.id)?.status !== "active")
-              notices.done({
-                botId: run.botId,
-                threadId: run.threadId,
-                summary: state.text,
-                routine: run.trigger === "routine" || run.routineRunId !== null,
-              })
-          }
-        })
-      } else {
-        failTurn({
-          run,
-          state,
-          store,
-          thread,
-          errorClass,
-          errorMessage:
-            workRoot && !workRoot.success
-              ? "Não foi possível publicar o registro de efeitos do turno"
-              : (state.completionError?.errorMessage ?? "Provider turn failed"),
-        })
       }
-    } else {
-      failTurn({
-        run,
-        state,
-        store,
-        thread,
-        errorClass: state.cancelRequested ? "canceled" : (state.completionError?.errorClass ?? result.errorCode),
-        errorMessage: result.error,
-      })
+      try {
+        if (!isLive(run)) return
+        const elapsed = Date.now() - (run.startedAt ?? Date.now())
+        state.usage.durationMs = elapsed
+        if (result.success) {
+          state.externalSessionId = state.externalSessionId ?? result.externalSessionId
+          state.rolloutPath = state.rolloutPath ?? result.rolloutPath
+          const sessionRow = persistence.getActiveSession({ threadId: thread.id, provider: bot.provider }) ??
+            session ?? {
+              id: kernel.newId(),
+              threadId: thread.id,
+              provider: bot.provider,
+              externalSessionId: state.externalSessionId,
+              rolloutPath: state.rolloutPath,
+              fingerprint: mcpFingerprint.hash,
+              state: "active",
+              model: bot.model,
+              createdAt: Date.now(),
+              lastUsedAt: Date.now(),
+            }
+          persistence.saveSession({
+            ...sessionRow,
+            externalSessionId: state.externalSessionId,
+            rolloutPath: state.rolloutPath,
+            fingerprint: mcpFingerprint.hash,
+            state: "active",
+            lastUsedAt: Date.now(),
+          })
+          const providerErrorClass = state.cancelRequested
+            ? "canceled"
+            : (state.completionError?.errorClass ?? (result.status === "succeeded" ? null : "cli_crash"))
+          const workRoot = providerErrorClass ? null : work.publishRoot({ turnId: run.id })
+          const errorClass = workRoot && !workRoot.success ? "tool_error" : providerErrorClass
+          if (!errorClass) {
+            const plan = state.continueAfterApproval
+              ? planContinuation({ run, reason: "permission_granted", lastActivityAt: Date.now() })
+              : null
+            state.continueAfterApproval = false
+            await finishLiveRun(
+              run,
+              () => {
+                ensureReply({ run, state, store, parentId: run.requestMessageId ?? thread.activeLeafId ?? run.id })
+                finishParts({ run, state, reason: "unknown" })
+                const conclusion = turnConclusion({
+                  parts: state.parts,
+                  requestText: (originalRequest ?? request)?.text ?? "",
+                  pendingPartText: state.pendingPartText,
+                })
+                if (conclusion)
+                  handleEvent({
+                    run,
+                    store,
+                    state,
+                    event: { type: "text_delta", itemId: kernel.newId(), delta: conclusion },
+                  })
+                publishMessage({ store, state, run, status: "complete" })
+                updateRun(run, {
+                  status: "succeeded",
+                  errorClass: null,
+                  errorMessage: null,
+                  usage: state.usage,
+                  finishedAt: Date.now(),
+                })
+                if (plan) scheduleContinuation({ run, plan })
+                else {
+                  if (remembers && request)
+                    mem0?.sync({
+                      botId: bot.id,
+                      threadId: thread.id,
+                      userText: request.text,
+                      assistantText: state.text,
+                    })
+                  finishRoutineRun({ run, state, status: "succeeded" })
+                  if (goals.getForRun(run.id)?.status !== "active")
+                    notices.done({
+                      botId: run.botId,
+                      threadId: run.threadId,
+                      summary: state.text,
+                      routine: run.trigger === "routine" || run.routineRunId !== null,
+                    })
+                }
+              },
+              state.replyMessageId ?? undefined,
+            )
+          } else {
+            await failTurn({
+              run,
+              state,
+              store,
+              thread,
+              errorClass,
+              errorMessage:
+                workRoot && !workRoot.success
+                  ? "Não foi possível publicar o registro de efeitos do turno"
+                  : (state.completionError?.errorMessage ?? "Provider turn failed"),
+            })
+          }
+        } else {
+          await failTurn({
+            run,
+            state,
+            store,
+            thread,
+            errorClass: state.cancelRequested ? "canceled" : (state.completionError?.errorClass ?? result.errorCode),
+            errorMessage: result.error,
+          })
+        }
+      } finally {
+        active.delete(run.threadId)
+        controllers.delete(run.id)
+        providers.delete(run.id)
+        void drain()
+      }
     }
-    active.delete(run.threadId)
-    controllers.delete(run.id)
-    providers.delete(run.id)
-    void drain()
+    if (runStage) await runStage("runtime_turn_finalization", finalizeProviderTurn)
+    else await finalizeProviderTurn()
   }
 
   const finalizeFailure = ({
@@ -1545,73 +1696,81 @@ export const createRuntimeEngine = ({
     errorClass: RunErrorClass
     errorMessage: string
     continuing?: boolean
-  }): void => {
+  }): Promise<void> => {
     const errorClass = refineErrorClass(reportedErrorClass, errorMessage)
-    finishLiveRun(run, () => {
-      state.parts = tools.finish(
-        run,
-        state.parts,
-        errorClass === "canceled"
-          ? "cancelled_by_user"
-          : errorClass === "app_restart"
-            ? "interrupted_by_restart"
-            : "failed",
-      )
-      state.parts = state.parts.map((part) => {
-        if (part.type !== "approval" || part.decision !== "pending") return part
-        pendingApprovals.delete(part.approvalId)
-        notices.resolve({ requestId: part.approvalId, resolution: "deny" })
-        return { ...part, decision: "expired", resolvedAt: Date.now() }
-      })
-      const safeError = bounded({ value: kernel.redact(errorMessage), max: 2_000 })
-      kernel.log({
-        level: errorClass === "canceled" ? "info" : "error",
-        module: run.provider,
-        msg: "Falha no turno",
-        data: { botId: run.botId, threadId: run.threadId, runId: run.id, errorClass, error: safeError },
-      })
-      ensureReply({ run, state, store, parentId: run.requestMessageId ?? thread.activeLeafId ?? run.id })
-      const noticeCode =
-        errorClass === "canceled" ? "run_canceled" : errorClass === "app_restart" ? "app_restart" : "run_failed"
-      const friendlyError = publicError(errorClass)
-      const failure = safeRunFailure(errorClass, safeError)
-      const friendlyMessage = isMcpStartupError(safeError)
-        ? failure.detail
-        : `${failure.detail} [${friendlyError.code}]`
-      state.parts.push({
-        type: "notice",
-        level: errorClass === "canceled" ? "info" : "error",
-        code: noticeCode,
-        ...(noticeCode === "run_failed" ? { failure } : {}),
-        text: errorClass === "canceled" ? "Cancelado por você" : `${errorClass}: ${friendlyMessage}`,
-      })
-      publishMessage({ store, state, run, status: statusForError(errorClass) === "canceled" ? "canceled" : "failed" })
-      const carryover = state.turnStarted
-        ? `[touri: your previous turn ended with ${errorClass}. Partial output: "${bounded({ value: state.text, max: 1_500 })}"]`
-        : `[touri: your previous turn did not run (${errorClass}: ${safeError}). The user's message was: "${bounded({ value: getActivePathMessage({ store, run })?.text ?? "", max: 1_500 })}"]`
-      store.updateThread({ threadId: thread.id, patch: { carryoverNote: carryover } })
-      updateRun(run, {
-        status: statusForError(errorClass),
-        errorClass,
-        errorMessage: safeError,
-        usage: state.usage,
-        finishedAt: Date.now(),
-      })
-      if (continuing) return
-      finishRoutineRun({
-        run,
-        state,
-        status: errorClass === "canceled" || errorClass === "app_restart" ? "canceled" : "failed",
-        summary: state.text || `${errorClass}: ${safeError}`,
-      })
-      if (errorClass === "canceled" || errorClass === "app_restart") return
-      notices.failure({
-        botId: run.botId,
-        threadId: run.threadId,
-        routine: run.routineRunId !== null,
-        reason: friendlyMessage,
-      })
-    })
+    return finishLiveRun(
+      run,
+      () => {
+        finishParts({
+          run,
+          state,
+          reason:
+            errorClass === "canceled"
+              ? "cancelled_by_user"
+              : errorClass === "app_restart"
+                ? "interrupted_by_restart"
+                : "failed",
+        })
+        state.parts = state.parts.map((part, index) => {
+          if (part.type !== "approval" || part.decision !== "pending") return part
+          pendingApprovals.delete(part.approvalId)
+          notices.resolve({ requestId: part.approvalId, resolution: "deny" })
+          state.dirtyParts.add(index)
+          return { ...part, decision: "expired", resolvedAt: Date.now() }
+        })
+        const safeError = bounded({ value: kernel.redact(errorMessage), max: 2_000 })
+        kernel.log({
+          level: errorClass === "canceled" ? "info" : "error",
+          module: run.provider,
+          msg: "Falha no turno",
+          data: { botId: run.botId, threadId: run.threadId, runId: run.id, errorClass, error: safeError },
+        })
+        ensureReply({ run, state, store, parentId: run.requestMessageId ?? thread.activeLeafId ?? run.id })
+        const noticeCode =
+          errorClass === "canceled" ? "run_canceled" : errorClass === "app_restart" ? "app_restart" : "run_failed"
+        const friendlyError = publicError(errorClass)
+        const failure = safeRunFailure(errorClass, safeError)
+        const friendlyMessage = isMcpStartupError(safeError)
+          ? failure.detail
+          : `${failure.detail} [${friendlyError.code}]`
+        const noticeIndex = state.parts.length
+        state.parts.push({
+          type: "notice",
+          level: errorClass === "canceled" ? "info" : "error",
+          code: noticeCode,
+          ...(noticeCode === "run_failed" ? { failure } : {}),
+          text: errorClass === "canceled" ? "Cancelado por você" : `${errorClass}: ${friendlyMessage}`,
+        })
+        state.dirtyParts.add(noticeIndex)
+        publishMessage({ store, state, run, status: statusForError(errorClass) === "canceled" ? "canceled" : "failed" })
+        const carryover = state.turnStarted
+          ? `[touri: your previous turn ended with ${errorClass}. Partial output: "${bounded({ value: state.text, max: 1_500 })}"]`
+          : `[touri: your previous turn did not run (${errorClass}: ${safeError}). The user's message was: "${bounded({ value: getActivePathMessage({ store, run })?.text ?? "", max: 1_500 })}"]`
+        store.updateThread({ threadId: thread.id, patch: { carryoverNote: carryover } })
+        updateRun(run, {
+          status: statusForError(errorClass),
+          errorClass,
+          errorMessage: safeError,
+          usage: state.usage,
+          finishedAt: Date.now(),
+        })
+        if (continuing) return
+        finishRoutineRun({
+          run,
+          state,
+          status: errorClass === "canceled" || errorClass === "app_restart" ? "canceled" : "failed",
+          summary: state.text || `${errorClass}: ${safeError}`,
+        })
+        if (errorClass === "canceled" || errorClass === "app_restart") return
+        notices.failure({
+          botId: run.botId,
+          threadId: run.threadId,
+          routine: run.routineRunId !== null,
+          reason: friendlyMessage,
+        })
+      },
+      state.replyMessageId ?? undefined,
+    )
   }
 
   const resumeEnabled = (): boolean => {
@@ -1750,6 +1909,7 @@ export const createRuntimeEngine = ({
       threadId: thread.id,
       requestMessageId: marker.message.id,
       trigger: run.routineRunId ? "routine" : "retry",
+      continuing: true,
       ...(run.routineRunId ? { routineRunId: run.routineRunId } : {}),
     })
     if (!next.success) return false
@@ -1803,18 +1963,22 @@ export const createRuntimeEngine = ({
     const timer = setTimeout(
       () => {
         pendingContinuations.delete(run.id)
-        // A newer turn on the thread (the user wrote meanwhile) supersedes the continuation.
-        const superseded = persistence.listRuns(run.threadId)[0]?.id !== run.id
-        const ready =
-          !shuttingDown && ownsRuntime() && (plan.reason === "permission_granted" || resumeEnabled()) && !superseded
+        signalDrainChange()
+        const ready = !shuttingDown && canStartContinuation(run, plan)
         if (!ready || !startContinuation({ run, plan })) abandonContinuation({ run, status: "failed" })
       },
       plan.reason === "permission_granted" ? 0 : resumeBackoffMs,
     )
-    pendingContinuations.set(run.id, { timer, run })
+    pendingContinuations.set(run.id, { timer, run, plan })
   }
 
-  const failTurn = ({
+  const canStartContinuation = (run: Run, plan: ContinuationPlan): boolean =>
+    ownsRuntime() &&
+    (plan.reason === "permission_granted" || resumeEnabled()) &&
+    // A newer user turn supersedes a continuation, including during shutdown.
+    persistence.listRuns(run.threadId)[0]?.id === run.id
+
+  const failTurn = async ({
     run,
     state,
     store,
@@ -1828,12 +1992,12 @@ export const createRuntimeEngine = ({
     thread: Thread
     errorClass: RunErrorClass
     errorMessage: string
-  }): void => {
+  }): Promise<void> => {
     const errorClass = refineErrorClass(reportedErrorClass, errorMessage)
     const crashed =
       CRASH_ERROR_CLASSES.includes(errorClass) && state.turnStarted && !state.cancelRequested && isLive(run)
     const plan = crashed ? planContinuation({ run, reason: "provider_crash", lastActivityAt: Date.now() }) : null
-    finalizeFailure({ run, state, store, thread, errorClass, errorMessage, continuing: plan !== null })
+    await finalizeFailure({ run, state, store, thread, errorClass, errorMessage, continuing: plan !== null })
     if (plan) scheduleContinuation({ run, plan })
   }
 
@@ -1865,11 +2029,11 @@ export const createRuntimeEngine = ({
 
   const drain = async (): Promise<void> => {
     // A recovered turn must not run alongside the previous provider process.
-    await startupCleanup
+    await ready
     while (!shuttingDown && ownsRuntime() && active.size < getMaxConcurrentRuns()) {
       const nextIndex = queued.findIndex((runId) => {
         const run = persistence.getRun(runId)
-        return run !== null && !active.has(run.threadId)
+        return run !== null && !active.has(run.threadId) && (!draining || canDrainRun(run.id))
       })
       if (nextIndex < 0) return
       const runId = queued[nextIndex]
@@ -1881,7 +2045,12 @@ export const createRuntimeEngine = ({
       updateRun(run, { status: "starting", startedAt: Date.now() })
       const execution = executeGoalTurn(run)
       executions.set(run.id, execution)
-      void execution.finally(() => executions.delete(run.id)).catch(() => {})
+      void execution
+        .finally(() => {
+          executions.delete(run.id)
+          signalDrainChange()
+        })
+        .catch(() => {})
     }
   }
 
@@ -1891,17 +2060,24 @@ export const createRuntimeEngine = ({
     trigger,
     routineRunId,
     delegated = false,
+    continuing = false,
   }: {
     threadId: Id
     requestMessageId: Id
     trigger: RunTrigger
     routineRunId?: Id
     delegated?: boolean
-  }): Result<{ run: Run }, "THREAD_NOT_FOUND" | "BOT_PAUSED"> => {
+    continuing?: boolean
+  }): Result<{ run: Run }, "THREAD_NOT_FOUND" | "BOT_PAUSED" | "RUNTIME_DRAINING"> => {
+    if (shuttingDown || (draining && !delegated && !continuing))
+      return { success: false, errorCode: "RUNTIME_DRAINING", error: "O servidor está encerrando." }
+
     const store = kernel.services.use("store.api")
     const thread = store?.getThread({ threadId })
     const bot = thread ? store?.getBot({ botId: thread.botId }) : null
     if (!thread || !bot) return { success: false, errorCode: "THREAD_NOT_FOUND", error: "Thread not found" }
+    const activeRequest = persistence.findActiveRunForRequest({ threadId, requestMessageId })
+    if (activeRequest) return { success: true, run: activeRequest }
     if (bot.paused || bot.machine === "cloud")
       return {
         success: false,
@@ -1933,6 +2109,8 @@ export const createRuntimeEngine = ({
       // A synchronous peer request cannot wait behind its caller's occupied slot.
       // Only group runtime uses this path; depth/call/cycle limits bound extra work.
       queueMicrotask(() => {
+        if (shuttingDown) return
+
         if (active.has(threadId)) {
           cancel(run.id)
           return
@@ -1983,6 +2161,17 @@ export const createRuntimeEngine = ({
           thread,
           errorClass: "canceled",
           errorMessage: "Turno cancelado antes de iniciar",
+        }).catch(() => {
+          try {
+            kernel.log({
+              level: "error",
+              module: "runtime",
+              msg: "Could not finalize canceled run",
+              data: { threadId: run.threadId, runId: run.id },
+            })
+          } catch {
+            // A storage failure can also prevent writing its diagnostic.
+          }
         })
         return { success: true, run }
       }
@@ -1998,7 +2187,10 @@ export const createRuntimeEngine = ({
     const state = getState(id)
     state.cancelRequested = true
     controllers.get(id)?.abort()
-    state.parts = tools.finish(run, state.parts, "cancelled_by_user")
+    finishParts({ run, state, reason: "cancelled_by_user", persist: false })
+    state.parts.forEach((part, index) => {
+      if (part.type === "text" || part.type === "reasoning") state.dirtyParts.add(index)
+    })
     const store = kernel.services.use("store.api")
     if (store) publishMessage({ store, state, run, status: "streaming" })
     approvalBridge.cancelRun(id)
@@ -2019,7 +2211,7 @@ export const createRuntimeEngine = ({
     await Promise.all(runIds.map((runId) => executions.get(runId)))
   }
 
-  const retry = (id: Id): Result<{ run: Run }, "NOT_FOUND" | "THREAD_NOT_FOUND" | "BOT_PAUSED" | "CONFLICT"> => {
+  const retry: RuntimeEngine["retry"] = (id) => {
     const previous = persistence.getRun(id)
     if (!previous?.requestMessageId) return { success: false, errorCode: "NOT_FOUND", error: "Run not found" }
     if (["queued", "starting", "running", "succeeded"].includes(previous.status))
@@ -2321,8 +2513,10 @@ export const createRuntimeEngine = ({
     scheduledFor?: number
   }): Result<
     { routineRun: RoutineRun },
-    "NOT_FOUND" | "INVALID_ARGS" | "THREAD_NOT_FOUND" | "BOT_PAUSED" | "DELEGATION_LIMIT"
+    "NOT_FOUND" | "INVALID_ARGS" | "THREAD_NOT_FOUND" | "BOT_PAUSED" | "DELEGATION_LIMIT" | "RUNTIME_DRAINING"
   > => {
+    if (draining) return { success: false, errorCode: "RUNTIME_DRAINING", error: "O servidor está encerrando." }
+
     const routine = persistence.getRoutine(routineId)
     const store = kernel.services.use("store.api")
     if (!routine || !store) return { success: false, errorCode: "NOT_FOUND", error: "Routine not found" }
@@ -2465,7 +2659,7 @@ export const createRuntimeEngine = ({
   }
 
   const tick = async (now = getNow()): Promise<void> => {
-    if (shuttingDown || !ownsRuntime()) return
+    if (shuttingDown || draining || !ownsRuntime()) return
     const updateNextRun = ({ routineId, nextRunAt }: { routineId: Id; nextRunAt: number | null }): void => {
       const latest = persistence.getRoutine(routineId)
       if (latest) persistence.updateRoutine({ ...latest, nextRunAt, updatedAt: Date.now() })
@@ -2505,9 +2699,39 @@ export const createRuntimeEngine = ({
     }
   }
 
+  const beginDrain = (): void => {
+    draining = true
+  }
+
+  const canDrainRun = (runId: Id): boolean => continuations.link(runId) !== null || continuations.isGroupRun(runId)
+  const hasDrainWork = (): boolean => executions.size > 0 || pendingContinuations.size > 0 || queued.some(canDrainRun)
+  const waitForDrainChange = (changed: Promise<void>): Promise<boolean> =>
+    new Promise((resolve) => {
+      const timeout = setTimeout(() => resolve(false), DRAIN_CHANGE_TIMEOUT_MS)
+      void changed.then(() => {
+        clearTimeout(timeout)
+        resolve(true)
+      })
+    })
+
+  const waitForDrain = async (): Promise<void> => {
+    await startupCleanup
+    while (!shuttingDown && hasDrainWork()) {
+      const changed = drainChange.promise
+      await drain()
+      await Promise.all([...executions.values()])
+      if (!hasDrainWork()) return
+      if (pendingContinuations.size > 0) {
+        await changed
+        continue
+      }
+      if (!(await waitForDrainChange(changed))) return
+    }
+  }
+
   const shutdown = (): Promise<void> => {
     if (shutdownPromise) return shutdownPromise
-    shuttingDown = true
+    draining = true
     unsubscribeGroupTurns()
     for (const state of states.values()) {
       if (state.outputTimer) clearTimeout(state.outputTimer)
@@ -2516,8 +2740,12 @@ export const createRuntimeEngine = ({
     for (const [id, pending] of pendingContinuations) {
       clearTimeout(pending.timer)
       pendingContinuations.delete(id)
-      abandonContinuation({ run: pending.run, status: "failed" })
+      // Save the next run before stopping so a backoff or approval cannot disappear.
+      if (!canStartContinuation(pending.run, pending.plan) || !startContinuation(pending))
+        abandonContinuation({ run: pending.run, status: "failed" })
     }
+    shuttingDown = true
+    signalDrainChange()
     for (const [id, controller] of controllers) {
       const state = getState(id)
       state.completionError ??= { errorClass: "app_restart", errorMessage: "touri restarted" }
@@ -2525,7 +2753,7 @@ export const createRuntimeEngine = ({
     }
     approvalBridge.dispose()
     shutdownPromise = (async () => {
-      await startupCleanup
+      await ready
       await Promise.all(Object.values(adapters).map((adapter) => adapter.shutdown()))
       await Promise.all(executions.values())
     })()
@@ -2544,6 +2772,7 @@ export const createRuntimeEngine = ({
       }),
     )
   const recovered = new Set<Id>()
+  const startupRecoveries: Array<Promise<void>> = []
   for (const run of persistence.listActiveRuns()) {
     recovered.add(run.id)
     const store = kernel.services.use("store.api")
@@ -2568,7 +2797,7 @@ export const createRuntimeEngine = ({
         reason: "app_restart",
         lastActivityAt: Math.max(run.startedAt ?? run.queuedAt, reply?.updatedAt ?? 0),
       })
-      finalizeFailure({
+      const recovery = finalizeFailure({
         run,
         state,
         store,
@@ -2576,8 +2805,10 @@ export const createRuntimeEngine = ({
         errorClass: "app_restart",
         errorMessage: "touri restarted",
         continuing: plan !== null,
+      }).then(() => {
+        if (plan && !startContinuation({ run, plan })) abandonContinuation({ run, status: "canceled" })
       })
-      if (plan && !startContinuation({ run, plan })) abandonContinuation({ run, status: "canceled" })
+      startupRecoveries.push(recovery)
       continue
     }
     const finishedAt = Date.now()
@@ -2624,10 +2855,22 @@ export const createRuntimeEngine = ({
   // Recovery repairs persisted history once. Terminal transitions already settle
   // their own tools; repeating recovery per turn rescans every previous result.
   if (recoveryStore) tools.reconcile(recoveryStore)
-  queueMicrotask(() => void drain())
+  const ready = Promise.allSettled([startupCleanup, ...startupRecoveries]).then((results) => {
+    if (results.every((result) => result.status === "fulfilled")) return
+    try {
+      kernel.log({
+        level: "error",
+        module: "runtime",
+        msg: "Startup run recovery did not complete",
+      })
+    } catch {
+      // A startup recovery failure can also prevent writing its diagnostic.
+    }
+  })
+  queueMicrotask(() => void ready.then(() => drain()))
 
   return {
-    ready: startupCleanup,
+    ready,
     goals,
     enqueue,
     activeRun,
@@ -2652,6 +2895,8 @@ export const createRuntimeEngine = ({
     deleteRoutine,
     runRoutine,
     tick,
+    beginDrain,
+    waitForDrain,
     shutdown,
   }
 }

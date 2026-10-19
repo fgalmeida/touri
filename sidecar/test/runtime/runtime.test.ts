@@ -114,6 +114,7 @@ const fixture = async ({
   runtime.kernel.spawnTree = fakeProviderSpawn(runtime.kernel.spawnTree, fakePath, scenario)
   const timestamp = Date.now()
   const bot: Bot = {
+    teamBuilder: false,
     id: "bot-runtime",
     name: "runtime",
     title: null,
@@ -194,7 +195,7 @@ const fixture = async ({
 
 const closeFixture = async (value: Fixture): Promise<void> => {
   await value.engine.shutdown()
-  value.runtime.stop()
+  await value.runtime.stop()
   rmSync(value.root, { recursive: true, force: true })
   rmSync(value.assets, { recursive: true, force: true })
 }
@@ -245,7 +246,7 @@ test("pausing a cached routine prevents cron attempts and survives runtime repla
     expect(replacement.listRoutines()[0]).toMatchObject({ enabled: false, nextRunAt: null })
   } finally {
     await replacement?.shutdown()
-    reopened?.stop()
+    await reopened?.stop()
     writerDb.close()
     await closeFixture(f)
   }
@@ -602,8 +603,7 @@ test("interleaved text and reasoning keep transcript snapshots and delta offsets
       [0, 0, "Vou "],
       [0, 4, "conferir."],
       [1, 11, "a fila."],
-      [2, 0, "\n\nPronto"],
-      [2, 8, "."],
+      [2, 0, "\n\nPronto."],
     ])
   } finally {
     await closeFixture(f)
@@ -818,6 +818,47 @@ test.serial("the store/runtime integration publishes coalesced deltas once in or
   }
 })
 
+test.serial("publishes pending parts before deltas for later parts", async () => {
+  const value = await fixture({
+    scenario: {
+      events: [
+        { type: "command", callId: "first-part", command: "echo ready", output: "ready" },
+        { type: "delta", delta: "Next part." },
+        { type: "complete" },
+      ],
+    },
+  })
+  let unsubscribe: (() => void) | null = null
+  try {
+    await initStore(value.runtime.kernel)
+    const store = value.runtime.kernel.services.use("store.api")
+    if (!store) throw new Error("store service was not initialized")
+    const updates: Array<"part" | "delta"> = []
+    unsubscribe = value.runtime.kernel.subscribe(({ event }) => {
+      if (
+        event.type === "message.parts" &&
+        event.parts.some(({ part }) => "callId" in part && part.callId === "first-part")
+      )
+        updates.push("part")
+      if (event.type === "message.delta") updates.push("delta")
+    })
+
+    const request = addUser(store, value.thread, "Confira a ordem das partes.")
+    const queued = value.engine.enqueue({ threadId: value.thread.id, requestMessageId: request.id, trigger: "user" })
+    if (!queued.success) throw new Error(queued.error)
+    await waitFor(() => terminal(queued.run.status))
+
+    expect(queued.run.status).toBe("succeeded")
+    const partIndex = updates.indexOf("part")
+    const deltaIndex = updates.indexOf("delta")
+    expect(partIndex).toBeGreaterThanOrEqual(0)
+    expect(deltaIndex).toBeGreaterThan(partIndex)
+  } finally {
+    unsubscribe?.()
+    await closeFixture(value)
+  }
+})
+
 test.serial("tool publications persist only changed parts and preserve completed output references", async () => {
   const output = "resultado ".repeat(2000)
   const prose = "prosa ".repeat(4000)
@@ -860,14 +901,24 @@ test.serial("tool publications persist only changed parts and preserve completed
       if (!queued.success) throw new Error(queued.error)
       await waitFor(() => terminal(queued.run.status))
       expect(queued.run.status).toBe("succeeded")
+      const published = patches.flatMap(({ parts }) => parts)
+      const first = published.filter(({ part }) => "callId" in part && part.callId === "first")
+      const second = published.filter(({ part }) => "callId" in part && part.callId === "second")
+
+      // A slice boundary can publish both completed frames separately; unchanged parts must stay absent.
+      expect(first).toHaveLength(1)
+      expect(second.length).toBeGreaterThanOrEqual(1)
+      expect(second.length).toBeLessThanOrEqual(2)
+      expect(published).toHaveLength(first.length + second.length)
       expect(
-        patches.map((patch) => patch.parts.map(({ part }) => ("callId" in part ? part.callId : part.type))),
-      ).toEqual([["first"], ["second"], ["second"]])
+        second.every(
+          (patch, index) => index === 0 || JSON.stringify(patch.part) !== JSON.stringify(second[index - 1]?.part),
+        ),
+      ).toBe(true)
       expect(JSON.stringify(patches)).not.toContain(prose)
       expect(JSON.stringify(patches)).not.toContain(output)
-      const completed = patches[1]?.parts[0]?.part
+      const completed = second.at(-1)?.part
       expect(completed).toMatchObject({ outputBytes: Buffer.byteLength(output), outputTail: "" })
-      expect(patches[2]?.parts[0]?.part).toMatchObject(completed ?? {})
       expect(updates).toHaveLength(1)
       expect(updates[0]?.patch.status).toBe("complete")
       const reply = store.activePath({ threadId: value.thread.id }).find((row) => row.id === queued.run.replyMessageId)
@@ -947,6 +998,49 @@ test.serial("slow turns receive provider interrupt and become canceled", async (
     expect(
       value.store.activePath({ threadId: value.thread.id }).find((message) => message.runId === run.run.id)?.parts,
     ).toContainEqual({ type: "notice", code: "run_canceled", level: "info", text: "Cancelado por você" })
+  } finally {
+    await closeFixture(value)
+  }
+})
+
+test.serial("draining finishes active turns, keeps queued turns for restart and yields to timers", async () => {
+  const value = await fixture({
+    maxConcurrentRuns: 1,
+    scenario: { slowMs: 100, deltas: ["active reply"] },
+  })
+  try {
+    const activeRequest = addUser(value.store, value.thread, "finish this turn")
+    const active = value.engine.enqueue({
+      threadId: value.thread.id,
+      requestMessageId: activeRequest.id,
+      trigger: "user",
+    })
+    const queuedRequest = addUser(value.store, value.thread, "keep this turn queued")
+    const queued = value.engine.enqueue({
+      threadId: value.thread.id,
+      requestMessageId: queuedRequest.id,
+      trigger: "user",
+    })
+    if (!active.success || !queued.success) throw new Error("Unable to queue fixture turns")
+    await waitFor(() => active.run.status === "running")
+
+    value.engine.beginDrain()
+    let timerFired = false
+    setTimeout(() => {
+      timerFired = true
+    }, 0)
+    const rejected = value.engine.enqueue({
+      threadId: value.thread.id,
+      requestMessageId: queuedRequest.id,
+      trigger: "user",
+    })
+    const drain = value.engine.waitForDrain()
+    await waitFor(() => timerFired, 100)
+    await drain
+
+    expect(active.run.status).toBe("succeeded")
+    expect(queued.run.status).toBe("queued")
+    expect(rejected).toMatchObject({ success: false, errorCode: "RUNTIME_DRAINING" })
   } finally {
     await closeFixture(value)
   }
@@ -1793,6 +1887,7 @@ test.serial("restart interrupts an in-flight routine run and does not block the 
         TOURI_FAKE_SCENARIO: value.scenario,
       },
     })
+    await restarted.ready
     expect(database.query("SELECT status, error_class FROM runs WHERE id = ?").get(oldRunId)).toEqual({
       status: "interrupted",
       error_class: "app_restart",
@@ -2343,12 +2438,12 @@ test.serial("transcript: Stop resolves pending provider tools before the interru
       ok: null,
     })
     expect(reply?.parts.find((part) => part.type === "file_change")).toMatchObject({ resolution: "cancelled_by_user" })
+    await waitFor(() => terminal(queued.run.status), 2000)
     expect(
       (value.runtime.kernel.db as Database)
         .query("SELECT resolution FROM tool_resolutions WHERE run_id = ? AND call_id = 'open-call'")
         .get(queued.run.id),
     ).toEqual({ resolution: "cancelled_by_user" })
-    await waitFor(() => terminal(queued.run.status), 2000)
     expect(queued.run.status).toBe("canceled")
   } finally {
     await closeFixture(value)
@@ -2717,7 +2812,7 @@ test.serial("deletion drops queued catch-up work and a cached due schedule stays
     value.engine.listRoutines()
     value.engine.listRoutineRuns(routine.id)
     expect(value.engine.deleteRoutine(routine.id).success).toBe(true)
-    expect(value.engine.listRuns(value.thread.id)[0]?.status).toBe("canceled")
+    await waitFor(() => value.engine.listRuns(value.thread.id)[0]?.status === "canceled")
     await value.engine.tick(Date.now() + 600_000)
     expect(value.engine.listRuns(value.thread.id)).toHaveLength(1)
     expect(value.engine.listRoutineRuns(routine.id)).toEqual([])
@@ -2733,7 +2828,7 @@ test.serial("deletion drops queued catch-up work and a cached due schedule stays
     expect(replacement.listRuns(value.thread.id)[0]?.status).toBe("canceled")
   } finally {
     await replacement?.shutdown()
-    reopened?.stop()
+    await reopened?.stop()
     await closeFixture(value)
   }
 })

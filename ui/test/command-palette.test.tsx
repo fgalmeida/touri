@@ -1,5 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import type { ApprovalPart } from "@touri/contracts"
+import axe from "axe-core"
 import { afterEach, expect, it, vi } from "vitest"
 import App from "../src/App"
 import { createMockApi } from "../src/api/mock"
@@ -281,4 +282,72 @@ it("leaves search indexing idle while the palette is closed", async () => {
 
   expect(input).toHaveFocus()
   expect(index).toHaveBeenCalled()
+})
+
+it("drops the listbox role when a query has no matches, announces empty results once, and has zero axe violations", async () => {
+  await start()
+  const input = await openPalette()
+  const dialog = screen.getByRole("dialog", { name: DIALOG })
+
+  expect(input).toHaveAttribute("aria-expanded", "true")
+  expect(within(dialog).getByRole("listbox", { name: "Resultados" })).toBeVisible()
+  const nonEmptyAxe = await axe.run(dialog, { rules: { "color-contrast": { enabled: false } } })
+  expect(nonEmptyAxe.violations.map((v) => v.id)).toEqual([])
+
+  fireEvent.change(input, { target: { value: "zzzz" } })
+
+  expect(input).toHaveAttribute("aria-expanded", "false")
+  expect(within(dialog).queryByRole("listbox")).toBeNull()
+  const statuses = within(dialog).getAllByRole("status")
+  expect(statuses).toHaveLength(1)
+  expect(statuses[0]).toHaveClass("visually-hidden")
+  expect(statuses[0]).toHaveTextContent("Nenhum resultado encontrado.")
+  const emptyCopy = dialog.querySelector(".command-palette-empty")
+  expect(emptyCopy).toHaveAttribute("aria-hidden", "true")
+  expect(emptyCopy).not.toHaveAttribute("role")
+  expect(emptyCopy).toHaveTextContent("Nenhum resultado encontrado.")
+
+  const emptyAxe = await axe.run(dialog, { rules: { "color-contrast": { enabled: false } } })
+  expect(emptyAxe.violations.map((v) => v.id)).toEqual([])
+})
+
+it("finds the Trabalho and Desempenho pages by their visible names", async () => {
+  const index = buildPaletteIndex({ bots: [], threads: [], settings: settingsIndex({ hasBot: true }), hasBot: true })
+  const getTop = (query: string) => searchPalette({ index, query, messages: [], recentIds: [] })[0]?.items[0]
+
+  expect(getTop("trabalho")?.label).toBe("Trabalho")
+  expect(getTop("desempenho")?.label).toBe("Desempenho")
+})
+
+it("returns a single result for the project dialog", async () => {
+  const index = buildPaletteIndex({ bots: [], threads: [], settings: settingsIndex({ hasBot: true }), hasBot: true })
+  const getLabels = (query: string) =>
+    searchPalette({ index, query, messages: [], recentIds: [] }).flatMap((group) =>
+      group.items.map((item) => item.label),
+    )
+
+  expect(getLabels("projeto").filter((label) => /^(Conectar projeto|Projetos)$/.test(label))).toEqual([
+    "Conectar projeto",
+  ])
+  expect(getLabels("projetos")).toContain("Conectar projeto")
+  expect(getLabels("projetos")).not.toContain("Projetos")
+})
+
+it("opens the Trabalho page, the Desempenho page and the projects dialog from the palette", async () => {
+  await start()
+
+  fireEvent.keyDown(await search("trabalho"), { key: "Enter" })
+  await closed()
+
+  expect(await screen.findByRole("heading", { name: /Trabalho/ })).toBeVisible()
+
+  fireEvent.keyDown(await search("desempenho"), { key: "Enter" })
+  await closed()
+
+  expect(await screen.findByRole("heading", { name: /Desempenho/ })).toBeVisible()
+
+  fireEvent.keyDown(await search("projetos"), { key: "Enter" })
+  await closed()
+
+  expect(await screen.findByRole("dialog", { name: /Conectar projeto/ })).toBeVisible()
 })

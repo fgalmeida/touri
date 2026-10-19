@@ -1,6 +1,11 @@
 import type { Kernel } from "@touri/contracts"
+import type { PerformanceStageRunner } from "../kernel/performance"
 
 export type ChildProcess = Extract<ReturnType<Kernel["spawnTree"]>, { success: true }>
+const PROVIDER_FRAME_BATCH_SIZE = 16
+const PROVIDER_FRAME_BATCH_MS = 8
+
+const yieldToEventLoop = (): Promise<void> => new Promise((resolve) => setImmediate(resolve))
 
 /** Observe diagnostics as they arrive, including writes split across chunks. */
 export const readProviderStderr = async (stream: ReadableStream<Uint8Array>, observe: (text: string) => void) => {
@@ -40,28 +45,61 @@ export const startLineReader = ({
   stream,
   onLine,
   onError,
+  runStage,
+  now = performance.now.bind(performance),
 }: {
   stream: ReadableStream<Uint8Array>
   onLine: (line: string) => void
   onError: (error: Error) => void
+  runStage?: PerformanceStageRunner
+  now?: () => number
 }): (() => void) => {
   let stopped = false
+  type Slice = { offset: number; processed: number; elapsedMs: number }
+  const processLines = ({ buffer, offset, processed, elapsedMs }: Slice & { buffer: string }): Slice => {
+    const startedAt = now()
+    // Parser cursors stay local so each slice bounds extraction and dispatch together.
+    let cursor = offset
+    let lines = processed
+    while (!stopped && lines < PROVIDER_FRAME_BATCH_SIZE) {
+      const newline = buffer.indexOf("\n", cursor)
+      if (newline < 0) break
+
+      const line = buffer.slice(cursor, newline).trim()
+      cursor = newline + 1
+      lines += 1
+      if (line) onLine(line)
+      if (elapsedMs + now() - startedAt >= PROVIDER_FRAME_BATCH_MS) break
+    }
+    return { offset: cursor, processed: lines, elapsedMs: elapsedMs + now() - startedAt }
+  }
+  const processBatch = (input: Slice & { buffer: string }): Slice => {
+    return runStage ? runStage("provider_frame_batch", processLines, input) : processLines(input)
+  }
   void (async () => {
     const reader = stream.getReader()
     const decoder = new TextDecoder()
     let buffer = ""
+    let processed = 0
+    let elapsedMs = 0
     try {
       while (!stopped) {
         const result = await reader.read()
         if (result.done) break
         buffer += decoder.decode(result.value, { stream: true })
-        let newline = buffer.indexOf("\n")
-        while (newline >= 0) {
-          const line = buffer.slice(0, newline).trim()
-          buffer = buffer.slice(newline + 1)
-          if (line) onLine(line)
-          newline = buffer.indexOf("\n")
+        let offset = 0
+        while (!stopped && buffer.indexOf("\n", offset) >= 0) {
+          const slice = processBatch({ buffer, offset, processed, elapsedMs })
+          offset = slice.offset
+          processed = slice.processed
+          elapsedMs = slice.elapsedMs
+          if (processed >= PROVIDER_FRAME_BATCH_SIZE || elapsedMs >= PROVIDER_FRAME_BATCH_MS) {
+            await yieldToEventLoop()
+            processed = 0
+            elapsedMs = 0
+          }
         }
+        buffer = buffer.slice(offset)
       }
       const tail = buffer.trim()
       if (!stopped && tail) onLine(tail)

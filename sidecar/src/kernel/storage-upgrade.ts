@@ -3,7 +3,7 @@ import { randomBytes } from "node:crypto"
 import { existsSync } from "node:fs"
 import { join } from "node:path"
 import { atomicWriteFile, movePrivateFile, prepareDatabaseFile, removePrivateFile } from "./files"
-import { materializeTranscript } from "./transcript-storage"
+import { materializeTranscriptBatch } from "./transcript-storage"
 
 const progressKey = "storage.upgrade.22"
 const marker = "storage_upgrade_22"
@@ -13,7 +13,6 @@ type Progress = { cursor: number; total: number; backup: boolean }
 export const maintainDatabasePages = (database: Database): void => {
   database.exec("PRAGMA busy_timeout = 0")
   try {
-    database.exec("PRAGMA wal_checkpoint(PASSIVE)")
     if ((database.query("PRAGMA auto_vacuum").get() as { auto_vacuum: number }).auto_vacuum === 2)
       database.exec("PRAGMA incremental_vacuum(32)")
   } finally {
@@ -207,17 +206,19 @@ export const createStorageUpgrade = ({
         await backup()
         if (stopped) return true
         const backedUp = { ...progress, backup: true }
-        database.transaction(() => {
-          // A later retention pass must not remove an output file required to
-          // restore this backup. Pinning additional concurrent outputs is safe.
-          database.exec("INSERT OR IGNORE INTO storage_backup_attachments SELECT id FROM attachments")
-          save(backedUp)
-        })()
+        database
+          .transaction(() => {
+            // A later retention pass must not remove an output file required to
+            // restore this backup. Pinning additional concurrent outputs is safe.
+            database.exec("INSERT OR IGNORE INTO storage_backup_attachments SELECT id FROM attachments")
+            save(backedUp)
+          })
+          .immediate()
         progress = backedUp
       }
       // Apply every durable delta before discarding its replay representation.
       // The projection, tool resolutions and output files keep the actual history.
-      materializeTranscript(database)
+      if (materializeTranscriptBatch(database)) return true
       const checkpoint = Number(
         (
           database.query("SELECT value FROM schema_meta WHERE key = 'transcript_event_checkpoint'").get() as {
@@ -230,26 +231,28 @@ export const createStorageUpgrade = ({
         .query("SELECT id, thread_id, seq FROM transcript_entries WHERE id > ? AND id <= ? ORDER BY id LIMIT 25")
         .all(progress.cursor, upper) as Array<{ id: number; thread_id: string; seq: number }>
       let cursor = progress.cursor
-      database.transaction(() => {
-        const started = performance.now()
-        for (const entry of rows) {
-          if (cursor !== progress?.cursor && performance.now() - started >= 8) break
-          database.query("UPDATE transcript_maintenance SET delete_before_id = ? WHERE id = 1").run(entry.id)
-          database.query("DELETE FROM transcript_entries WHERE id = ?").run(entry.id)
-          database.query("DELETE FROM rejections WHERE thread_id = ? AND seq = ?").run(entry.thread_id, entry.seq)
-          database
-            .query(`INSERT INTO transcript_retention(thread_id, through_seq) VALUES (?, ?)
+      database
+        .transaction(() => {
+          const started = performance.now()
+          for (const entry of rows) {
+            if (cursor !== progress?.cursor && performance.now() - started >= 8) break
+            database.query("UPDATE transcript_maintenance SET delete_before_id = ? WHERE id = 1").run(entry.id)
+            database.query("DELETE FROM transcript_entries WHERE id = ?").run(entry.id)
+            database.query("DELETE FROM rejections WHERE thread_id = ? AND seq = ?").run(entry.thread_id, entry.seq)
+            database
+              .query(`INSERT INTO transcript_retention(thread_id, through_seq) VALUES (?, ?)
             ON CONFLICT(thread_id) DO UPDATE SET through_seq = MAX(through_seq, excluded.through_seq)`)
-            .run(entry.thread_id, entry.seq)
-          cursor = entry.id
-        }
-        database.exec("UPDATE transcript_maintenance SET delete_before_id = 0 WHERE id = 1")
-        const complete = rows.length === 0 && checkpoint >= (progress?.total ?? 0)
-        if (complete) {
-          database.query("UPDATE schema_meta SET value = 'done' WHERE key = ?").run(marker)
-          database.query("DELETE FROM settings WHERE key = ?").run(progressKey)
-        } else if (progress) save({ ...progress, cursor })
-      })()
+              .run(entry.thread_id, entry.seq)
+            cursor = entry.id
+          }
+          database.exec("UPDATE transcript_maintenance SET delete_before_id = 0 WHERE id = 1")
+          const complete = rows.length === 0 && checkpoint >= (progress?.total ?? 0)
+          if (complete) {
+            database.query("UPDATE schema_meta SET value = 'done' WHERE key = ?").run(marker)
+            database.query("DELETE FROM settings WHERE key = ?").run(progressKey)
+          } else if (progress) save({ ...progress, cursor })
+        })
+        .immediate()
       if (rows.length === 0 && checkpoint >= progress.total) {
         progress = null
         return false

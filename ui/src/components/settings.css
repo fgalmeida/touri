@@ -664,6 +664,7 @@
   flex: 1;
   flex-direction: column;
   min-height: 0;
+  overflow: hidden;
 }
 .bot-create-content {
   flex: 1;
@@ -711,6 +712,11 @@
 }
 .bot-create-main .job-picker {
   margin-top: var(--space-12);
+}
+/* The form body owns scrolling so jobs and Advanced share one surface above the footer. */
+.bot-create-main .job-options {
+  max-height: none;
+  overflow: visible;
 }
 .bot-create-main > .avatar-picker {
   min-width: 0;
@@ -883,8 +889,9 @@
   }
   .settings-nav {
     display: flex;
+    flex-wrap: wrap;
     flex: none;
-    overflow-x: auto;
+    overflow-x: visible;
     padding: var(--space-8);
     border-right: 0;
     border-bottom: 1px solid var(--border-divider);

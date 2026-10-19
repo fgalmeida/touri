@@ -24,7 +24,7 @@ import { getHostLabel, getRoutineRunDateLabel, getRoutineRunTimeLabel, localizeN
 import { machineStateForDisplay } from "../machineState"
 import { messageMarkdown } from "../messageMarkdown"
 import { consumeTaskReview, requestTaskResume, reviewTaskEvent } from "../recoveryEvents"
-import { getRoutineReplyRun, isRoutineEmptyResult, isRoutineRun } from "../routineConversation"
+import { getRoutineReplyRun, isRoutineConversation, isRoutineEmptyResult, isRoutineRun } from "../routineConversation"
 import { type RoutineDraft, repeatTaskDraft, suggestedRoutineDraft } from "../routineDraft"
 import { failureTimeLabel, runErrorFor } from "../runError"
 import { getSidebarThreadTitle } from "../sidebarThreadTitle"
@@ -57,6 +57,7 @@ import { TurnActivity } from "./TurnActivity"
 import { toolStatus } from "./toolPresentation"
 import { approvalTools, assistantSegments } from "./turnActivityModel"
 import { type EditMessage, UserMessageEdit } from "./UserMessageEdit"
+import { usePhoneViewport } from "./usePhoneViewport"
 
 type ChatPanelProps = {
   composerKey?: string | undefined
@@ -80,6 +81,9 @@ type ChatPanelProps = {
   onOpenModel?: () => void
   onSelectProject?: (projectId: Id | null) => Promise<void>
   onAddProject?: () => void
+  activePath?: Array<Message> | undefined
+  goalRefreshRequest?: number
+  onGoalChange?: () => void
   thread: Thread | null
   bot: Bot | null
   machine?: MachineState | undefined
@@ -454,6 +458,11 @@ export const VirtualMessageList = ({
 const isResumeMarker = (message: Message): boolean =>
   message.role === "system" && message.parts.some((part) => part.type === "notice" && part.code === "run_resumed")
 
+const isGroupCoordinationPrompt = (message: Message): boolean => {
+  const marker = message.parts[0]
+  return message.role === "system" && marker?.type === "notice" && marker.code === "group_coordination_prompt"
+}
+
 const sameCalendarDay = (left: number, right: number): boolean => {
   const first = new Date(left)
   const second = new Date(right)
@@ -606,6 +615,7 @@ const MessageBubble = ({
       ...runError.recovery.actions,
       ...(message.runId &&
       message.status === "failed" &&
+      run?.errorClass !== "group_context_missing" &&
       !runError.recovery.actions.some((action) => ["retry", "review", "resume", "storage"].includes(action.kind))
         ? [{ kind: "retry" as const, label: t("Tentar de novo") }]
         : []),
@@ -718,7 +728,7 @@ const MessageBubble = ({
             ) : (
               <span role="img" aria-label={t("Membro excluído: {name}", { name: message.sender.name })}>
                 <BotAvatar
-                  bot={{ id: message.sender.id, color: "#6b7280", avatarShape: "cercle" }}
+                  bot={{ id: message.sender.id, color: "#6b7280", avatarShape: "none-none" }}
                   size={22}
                   state="idle"
                   still
@@ -895,6 +905,9 @@ export const ChatPanel = ({
   onEditGroup = () => {},
   focusApproval,
   thread,
+  activePath,
+  goalRefreshRequest = 0,
+  onGoalChange,
   bot,
   panelOpen = false,
   onTogglePanel,
@@ -921,6 +934,8 @@ export const ChatPanel = ({
   routines = [],
   routineRuns = [],
 }: ChatPanelProps) => {
+  const phone = usePhoneViewport()
+  const chatIsCovered = panelOpen && phone
   const host = useHost(api)
   const serverMode = useIsServerMode() || host === "server"
   const machine = machineStateForDisplay(rawMachine)
@@ -929,6 +944,13 @@ export const ChatPanel = ({
   const draftComposerRef = useRef<DraftComposerHandle>(null)
   const localAttachmentButtonRef = useRef<HTMLButtonElement>(null)
   const attachmentButtonRef = sharedAttachmentButtonRef ?? localAttachmentButtonRef
+  useEffect(() => {
+    if (!chatIsCovered) return
+    const frame = window.requestAnimationFrame(() => {
+      document.querySelector<HTMLButtonElement>("#bot-panel .bot-panel-top button")?.focus({ preventScroll: true })
+    })
+    return () => window.cancelAnimationFrame(frame)
+  }, [chatIsCovered])
   const activeRun = useMemo(
     () =>
       runs.find(
@@ -950,7 +972,7 @@ export const ChatPanel = ({
 
   if (!thread)
     return (
-      <section className="chat-panel">
+      <section className="chat-panel" inert={chatIsCovered || undefined} aria-hidden={chatIsCovered || undefined}>
         <header className="chat-header" data-tauri-drag-region="deep">
           <span className="chat-header-crumb">{t("Bots")}</span>
           <div className="chat-bot-chip">
@@ -984,27 +1006,23 @@ export const ChatPanel = ({
       </section>
     )
 
-  const visibleMessages = group
-    ? messages.filter((message) => message.threadId === thread.id)
-    : activeMessagePath(
+  const messagePath = group
+    ? messages.filter((message) => message.threadId === thread.id && !isGroupCoordinationPrompt(message))
+    : (activePath ??
+      activeMessagePath(
         messages.filter((message) => message.threadId === thread.id),
         thread.activeLeafId,
-      )
-  for (const message of messages) {
-    if (
+      ))
+  const visibleMessageIds = new Set(messagePath.map((message) => message.id))
+  const pendingMessages = messages.filter(
+    (message) =>
       message.threadId === thread.id &&
       ((message.delivery && message.delivery.status !== "acked") ||
         message.parts.some((part) => part.type === "approval" && part.decision === "pending")) &&
-      !visibleMessages.some((visible) => visible.id === message.id)
-    )
-      visibleMessages.push(message)
-  }
-  const routineConversation =
-    thread.kind === "routine" ||
-    thread.routineRunId != null ||
-    runs.some((run) => run.threadId === thread.id && isRoutineRun(run)) ||
-    routineRuns.some((run) => run.threadId === thread.id && run.runId !== null) ||
-    routines.some((routine) => routine.resultsThreadId === thread.id)
+      !visibleMessageIds.has(message.id),
+  )
+  const visibleMessages = [...messagePath, ...pendingMessages]
+  const routineConversation = isRoutineConversation({ thread, runs, routineRuns, routines })
   const repeatDraft =
     bot && !activeRun && !routineConversation
       ? group
@@ -1049,7 +1067,7 @@ export const ChatPanel = ({
     .find((part) => screenTool(part) && part.type === "tool_call" && toolStatus(part) === "running")
 
   return (
-    <section className="chat-panel">
+    <section className="chat-panel" inert={chatIsCovered || undefined} aria-hidden={chatIsCovered || undefined}>
       {group ? (
         <GroupHeader
           group={group}
@@ -1095,9 +1113,9 @@ export const ChatPanel = ({
           api={api}
           threadId={thread.id}
           bot={bot}
-          request={activeMessagePath(messages, thread.activeLeafId)
-            .filter((message) => message.role === "user")
-            .at(-1)}
+          surface="chat"
+          refreshRequest={goalRefreshRequest}
+          onChange={onGoalChange}
           busy={runs.some(
             (run) => run.threadId === thread.id && ["queued", "starting", "running"].includes(run.status),
           )}

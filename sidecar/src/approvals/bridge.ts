@@ -1,3 +1,4 @@
+import type { Database } from "bun:sqlite"
 import { isDeepStrictEqual } from "node:util"
 import type { ApprovalInput, ApprovalPart, ApprovalResult, Kernel, ServiceMap } from "@touri/contracts"
 import { redactStructured } from "../kernel/redact"
@@ -13,12 +14,15 @@ export const createApprovalBridge = ({
   timeoutMs = 30 * 60_000,
 }: {
   kernel: Kernel
-  onCard: (ctx: ApprovalInput["ctx"], part: ApprovalPart) => boolean
+  onCard: (ctx: ApprovalInput["ctx"], part: ApprovalPart) => boolean | Promise<boolean>
   timeoutMs?: number
 }) => {
   const grants = createStandingGrantStore(kernel)
   const notices = createRuntimeNotices({ kernel })
   let disposed = false
+  // These local registries hold approval ownership and the result card across asynchronous creation.
+  const pendingTeamThreads = new Set<string>()
+  const approvedTeams = new Map<string, { input: ApprovalInput; part: ApprovalPart }>()
   const outcomes: Array<{ input: ApprovalInput; message: string }> = []
   const remember = (input: ApprovalInput, message: string) => {
     if (input.scope.source === "claude" && input.ctx.runId) outcomes.push({ input, message })
@@ -28,9 +32,9 @@ export const createApprovalBridge = ({
     { input: ApprovalInput; part: ApprovalPart; resolve: (result: ApprovalResult) => void; cleanup: () => void }
   >()
 
-  const publishCard = (input: ApprovalInput, part: ApprovalPart): boolean => {
+  const publishCard = async (input: ApprovalInput, part: ApprovalPart): Promise<boolean> => {
     try {
-      return onCard(input.ctx, structuredClone(part))
+      return await onCard(input.ctx, structuredClone(part))
     } catch {
       kernel.log({ level: "warn", module: "approvals", msg: "Não foi possível atualizar o cartão de aprovação." })
       return false
@@ -47,37 +51,49 @@ export const createApprovalBridge = ({
       input.isCurrent?.() !== false
     )
   }
-  const finish = (
+  const finish = async (
     id: string,
     decision: ApprovalPart["decision"],
     message?: string,
     answered = false,
     standing = false,
-  ): void => {
+  ): Promise<void> => {
     const request = pending.get(id)
     if (!request) return
     pending.delete(id)
+    if (request.part.teamProposal) pendingTeamThreads.delete(request.input.ctx.threadId)
     request.cleanup()
     request.part.decision = decision
     request.part.resolvedAt = Date.now()
     request.part.standing = decision === "approved" && standing
-    publishCard(request.input, request.part)
+    const saved = await publishCard(request.input, request.part)
+    const resolvedDecision = saved ? decision : "denied"
+    if (resolvedDecision === "approved" && request.part.teamProposal) approvedTeams.set(id, request)
     notices.resolve({
       requestId: id,
-      resolution: decision === "approved" ? "allow" : decision === "expired" ? "expired" : answered ? "answer" : "deny",
+      resolution:
+        resolvedDecision === "approved"
+          ? "allow"
+          : resolvedDecision === "expired"
+            ? "expired"
+            : answered
+              ? "answer"
+              : "deny",
     })
     const outcome =
-      decision === "approved"
+      resolvedDecision === "approved"
         ? standing
           ? approvalOutcome.standing
           : approvalOutcome.once
-        : (message ?? approvalOutcome.denied)
-    if (decision !== "expired") remember(request.input, outcome)
+        : saved
+          ? (message ?? approvalOutcome.denied)
+          : "A aprovação não pôde ser salva."
+    if (resolvedDecision !== "expired" && saved) remember(request.input, outcome)
     request.resolve(
-      decision === "expired"
+      resolvedDecision === "expired"
         ? { success: false, errorCode: "TIMEOUT", error: "A aprovação expirou." }
-        : decision === "approved"
-          ? { success: true, behavior: "allow", updatedInput: request.input.input, message: outcome }
+        : resolvedDecision === "approved"
+          ? { success: true, behavior: "allow", approvalId: id, updatedInput: request.input.input, message: outcome }
           : { success: true, behavior: "deny", message: outcome },
     )
   }
@@ -92,7 +108,17 @@ export const createApprovalBridge = ({
       return { success: false, errorCode: "NOT_FOUND", error: "Bot ou conversa indisponível." }
     if (!isCurrent(input))
       return { success: false, errorCode: "DENIED", error: "A autorização mudou. Solicite a ação novamente." }
-    const allowStanding = input.allowStanding !== false && input.toolName !== "AskUserQuestion"
+    const teamReview = input.scope.server === "touri" && input.toolName === "team_create"
+    if (teamReview && (!input.teamProposal || pendingTeamThreads.has(input.ctx.threadId)))
+      return { success: false, errorCode: "DENIED", error: "Proposta de time indisponível ou já pendente." }
+    const teamProposal = teamReview ? redactStructured(input.teamProposal, kernel.redact) : undefined
+    if (teamReview && !isDeepStrictEqual(input.teamProposal, teamProposal))
+      return {
+        success: false,
+        errorCode: "DENIED",
+        error: "A proposta contém texto que seria ocultado no cartão. Remova esse conteúdo e tente novamente.",
+      }
+    const allowStanding = !teamReview && input.allowStanding !== false && input.toolName !== "AskUserQuestion"
     if (allowStanding && grants.has(input.ctx.botId, input.scope)) {
       remember(input, approvalOutcome.automatic)
       return { success: true, behavior: "allow", updatedInput: input.input, message: approvalOutcome.automatic }
@@ -121,6 +147,11 @@ export const createApprovalBridge = ({
       return { success: false, errorCode: "DENIED", error: "Os detalhes da rotina excedem o limite de revisão." }
     const approvalId = kernel.newId()
     const part: ApprovalPart = {
+      ...(teamReview
+        ? {
+            teamProposal: teamProposal as NonNullable<ApprovalPart["teamProposal"]>,
+          }
+        : {}),
       type: "approval",
       createdAt: Date.now(),
       approvalId,
@@ -133,8 +164,9 @@ export const createApprovalBridge = ({
       decision: "pending",
     }
     return new Promise((resolve) => {
-      const onAbort = () => finish(approvalId, "denied", "A ação foi cancelada.")
-      const timer = setTimeout(() => finish(approvalId, "expired"), timeoutMs)
+      const onAbort = () => void finish(approvalId, "denied", "A ação foi cancelada.")
+      const timer = setTimeout(() => void finish(approvalId, "expired"), timeoutMs)
+      if (teamReview) pendingTeamThreads.add(input.ctx.threadId)
       pending.set(approvalId, {
         input,
         part,
@@ -146,16 +178,21 @@ export const createApprovalBridge = ({
       })
       input.ctx.signal.addEventListener("abort", onAbort, { once: true })
       if (input.ctx.signal.aborted) return onAbort()
-      if (!publishCard(input, part)) return finish(approvalId, "denied", "Execução indisponível.")
-      if (!pending.has(approvalId)) return
-      notices.prompt({
-        botId: input.ctx.botId,
-        threadId: input.ctx.threadId,
-        requestId: approvalId,
-        toolName: input.toolName,
-        input: input.input,
-        detail: part.detail,
-        scope: part.scope,
+      void publishCard(input, part).then((saved) => {
+        if (!saved) {
+          void finish(approvalId, "denied", "Execução indisponível.")
+          return
+        }
+        if (!pending.has(approvalId)) return
+        notices.prompt({
+          botId: input.ctx.botId,
+          threadId: input.ctx.threadId,
+          requestId: approvalId,
+          toolName: input.toolName,
+          input: input.input,
+          detail: part.detail,
+          scope: part.scope,
+        })
       })
     })
   }
@@ -163,23 +200,58 @@ export const createApprovalBridge = ({
     const request = pending.get(approvalId)
     if (!request) return { success: false, errorCode: "NOT_FOUND", error: "Aprovação não encontrada." }
     if (!isCurrent(request.input)) {
-      finish(approvalId, "denied", "A ação foi cancelada ou a autorização mudou.")
+      await finish(approvalId, "denied", "A ação foi cancelada ou a autorização mudou.")
       return { success: false, errorCode: "NOT_FOUND", error: "A ação foi cancelada ou a autorização mudou." }
     }
     if (decision === "approved" && standing && request.part.allowStanding)
       grants.add(request.input.ctx.botId, request.input.scope)
-    finish(approvalId, decision, message, !!message, !!standing && !!request.part.allowStanding)
+    await finish(approvalId, decision, message, !!message, !!standing && !!request.part.allowStanding)
     return { success: true }
   }
-  const settle: ServiceMap["approvals.settle"] = ({ approvalId, decision }) => finish(approvalId, decision)
+  const completeTeam: ServiceMap["approvals.completeTeam"] = async ({ approvalId, ctx, result }) => {
+    const approved = approvedTeams.get(approvalId)
+    if (
+      !approved ||
+      approved.input.ctx.botId !== ctx.botId ||
+      approved.input.ctx.threadId !== ctx.threadId ||
+      approved.input.ctx.runId !== ctx.runId
+    )
+      return
+    approvedTeams.delete(approvalId)
+    const part = { ...approved.part, teamResult: result }
+    if (await publishCard(approved.input, part)) return
+    // A stop can finish the run during file creation. Persist the committed ledger on its card anyway.
+    const row = (kernel.db as Database)
+      .query("SELECT reply_message_id FROM runs WHERE id = ? AND thread_id = ?")
+      .get(ctx.runId, ctx.threadId) as { reply_message_id: string | null } | null
+    const store = kernel.services.use("store.api")
+    const message = row?.reply_message_id
+      ? store?.getPathMessage?.({ threadId: ctx.threadId, messageId: row.reply_message_id })
+      : null
+    if (!message?.parts.some((item) => item.type === "approval" && item.approvalId === approvalId)) return
+    if (!store) return
+    const update = store.updateMessageAsync ?? store.updateMessage
+    await update({
+      threadId: ctx.threadId,
+      messageId: message.id,
+      patch: {
+        parts: message.parts.map((item) => (item.type === "approval" && item.approvalId === approvalId ? part : item)),
+      },
+    })
+  }
+  const settle: ServiceMap["approvals.settle"] = ({ approvalId, decision }) => {
+    void finish(approvalId, decision)
+  }
   const dispose = () => {
     disposed = true
-    for (const id of pending.keys()) finish(id, "denied", "A execução terminou.")
+    for (const id of pending.keys()) void finish(id, "denied", "A execução terminou.")
+    pendingTeamThreads.clear()
+    approvedTeams.clear()
     outcomes.length = 0
   }
   const cancelRun = (runId: string) => {
     for (const [id, request] of pending)
-      if (request.input.ctx.runId === runId) finish(id, "denied", "A execução terminou.")
+      if (request.input.ctx.runId === runId) void finish(id, "denied", "A execução terminou.")
     for (let index = outcomes.length - 1; index >= 0; index--)
       if (outcomes[index]?.input.ctx.runId === runId) outcomes.splice(index, 1)
   }
@@ -195,5 +267,5 @@ export const createApprovalBridge = ({
     )
     return index < 0 ? null : (outcomes.splice(index, 1)[0]?.message ?? null)
   }
-  return { present, approve, settle, dispose, cancelRun, context }
+  return { present, approve, settle, dispose, cancelRun, context, completeTeam }
 }

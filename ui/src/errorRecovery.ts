@@ -1,5 +1,5 @@
 import { apiModelErrors, errorRegistry, type MessagePart, type Provider, publicError } from "@touri/contracts"
-import { hasRecordedActions, safeRunFailure, sanitizeDiagnostic } from "@touri/contracts/run-failure"
+import { hasRecordedActions, isModelAtCapacity, safeRunFailure, sanitizeDiagnostic } from "@touri/contracts/run-failure"
 import { providerName } from "./components/ProviderMark"
 import { ApiError, isServiceUnavailable } from "./errors"
 import { type Locale, t } from "./i18n"
@@ -38,6 +38,8 @@ export const errorRecovery = (error: unknown, context: RecoveryContext = {}): Er
     actions,
     classified,
   })
+  if (context.errorClass === "group_context_missing")
+    return view(tr("O grupo ou a conversa não existe mais. Este turno não foi executado."), [])
   // A recorded tool invocation may have committed even when its acknowledgement is absent.
   if (
     hasRecordedActions(context.parts ?? []) ||
@@ -65,6 +67,11 @@ export const errorRecovery = (error: unknown, context: RecoveryContext = {}): Er
     return view(tr("Entre novamente no {provedor} para continuar.", { provedor: provider }), [
       action("login", "Entrar na conta"),
     ])
+  if (isModelAtCapacity(raw))
+    return view(
+      `${tr("O modelo selecionado está sem capacidade no momento.")} ${tr("Escolha outro modelo nas configurações do bot ou tente de novo em alguns minutos.")}`,
+      [action("review", "Ver tarefa")],
+    )
   if (
     (error instanceof ApiError && error.status === 429) ||
     /\b429\b|rate_limit|TOURI-E1006|limite.*(?:uso|solicitações)|too many requests/i.test(text)

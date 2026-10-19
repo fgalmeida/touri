@@ -249,6 +249,7 @@ export const Sidebar = (props: SidebarProps) => {
                   insertedThreads={insertedThreads}
                   threads={sidebarDataByBot.get(bot.id)?.threads ?? []}
                   routineRuns={sidebarDataByBot.get(bot.id)?.routineRuns ?? []}
+                  runs={props.runs ?? []}
                   routineIds={routineIds}
                   routinesById={routinesById}
                   messages={messages}
@@ -356,6 +357,7 @@ const BotEntry = ({
   onHold,
   threads,
   routineRuns,
+  runs,
   routineIds,
   routinesById,
   messages,
@@ -381,6 +383,7 @@ const BotEntry = ({
   insertedThreads: ReadonlySet<string>
   threads: Array<Thread>
   routineRuns: Array<RoutineRun>
+  runs: Array<Run>
   routineIds: ReadonlySet<string> | undefined
   routinesById: ReadonlyMap<string, Routine>
   messages: Array<Message>
@@ -446,7 +449,7 @@ const BotEntry = ({
   const waiting = attention.find((item) => ["approval", "question", "takeover", "incident"].includes(item.kind))
   const approvals = pendingApprovalTargets(botMessages)
   const unread = threads.reduce((count, thread) => count + thread.unread, 0)
-  const preview = latestPreview({ threadIds: ids, messages })
+  const preview = latestPreview({ threadIds: ids, messages, runs })
   const reason =
     approvals.length || waiting?.kind === "approval"
       ? t("your approval")
@@ -487,6 +490,8 @@ const BotEntry = ({
     () => (expanded ? getSidebarThreads(threads, routineRuns, selectedThreadId, runningThreadIds, routineIds) : []),
     [expanded, threads, routineRuns, selectedThreadId, runningThreadIds, routineIds],
   )
+  const visibleUnread = sidebarThreads.reduce((count, entry) => count + entry.unread, 0)
+  const botUnread = unread - visibleUnread
   const visibleRoutineIds = sidebarThreads.flatMap(({ routineRun, deletedRoutine }) =>
     routineRun && !deletedRoutine ? [routineRun.routineId] : [],
   )
@@ -575,9 +580,9 @@ const BotEntry = ({
               role="img"
               aria-label={status ?? t("Em execução")}
             />
-          ) : unread > 0 ? (
-            <span className="sidebar-unread" role="img" aria-label={t("Unread messages", { count: unread })}>
-              {unread > 99 ? "99+" : unread}
+          ) : botUnread > 0 ? (
+            <span className="sidebar-unread" role="img" aria-label={t("Unread messages", { count: botUnread })}>
+              {botUnread > 99 ? "99+" : botUnread}
             </span>
           ) : null}
           <BotActionsMenu
@@ -695,7 +700,9 @@ const ThreadRow = ({
       {running ? (
         <span className="sidebar-status-dot state-running" role="img" aria-label={t("Em execução")} />
       ) : unread > 0 ? (
-        <span className="sidebar-unread">{unread > 99 ? "99+" : unread}</span>
+        <span className="sidebar-unread" role="img" aria-label={t("Unread messages", { count: unread })}>
+          {unread > 99 ? "99+" : unread}
+        </span>
       ) : null}
     </button>
   )

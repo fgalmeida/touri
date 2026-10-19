@@ -14,6 +14,7 @@ import { createGroupRuntime } from "../groups/runtime"
 import type { PerformanceStageRunner } from "../kernel/performance"
 import { buildChildEnv } from "../kernel/shell-env"
 import { getHostIdentity } from "../platform/host"
+import { createTeamTools } from "../teams/tools"
 import { createRuntimeEngine } from "./engine"
 import { listOpenCodeModels } from "./opencode/models"
 import { listProviderProfiles } from "./provider-profiles"
@@ -33,11 +34,19 @@ const continuityField = (value: unknown): Routine["continuity"] =>
   value === "results-thread" || value === "main-thread" ? value : "new-thread"
 const overlapField = (value: unknown): Routine["overlap"] => (value === "queue" ? "queue" : "skip")
 
+const getRouteErrorStatus = (errorCode: string): number => {
+  if (errorCode === "NOT_FOUND" || errorCode === "THREAD_NOT_FOUND") return 404
+  if (errorCode === "BOT_PAUSED") return 409
+  if (errorCode === "RUNTIME_DRAINING") return 503
+
+  return 400
+}
+
 const routeError = (
   errorCode: string,
   error: string,
 ): { status: number; json: { errorCode: string; error: string } } => ({
-  status: errorCode === "NOT_FOUND" || errorCode === "THREAD_NOT_FOUND" ? 404 : errorCode === "BOT_PAUSED" ? 409 : 400,
+  status: getRouteErrorStatus(errorCode),
   json: { errorCode, error },
 })
 
@@ -80,13 +89,30 @@ const routineInput = ({
 
 export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): Promise<void> => {
   const engine = createRuntimeEngine({ kernel, ...(runStage ? { runStage } : {}) })
+  let draining = false
+  let drainPromise: Promise<void> | null = null
+  kernel.services.provide("runtime.isDraining", () => draining)
   kernel.services.provide("runtime.settingsChanged", engine.settingsChanged)
   await engine.ready
   const groups = createGroupRuntime(kernel, engine)
   kernel.services.provide("groups.runtime", groups)
   const scheduler = createRoutineScheduler({ kernel, engine, ...(runStage ? { runStage } : {}) })
 
+  kernel.services.provide("runtime.beginDrain", () => {
+    if (drainPromise) return drainPromise
+    draining = true
+    scheduler.stop()
+    groups.beginDrain()
+    engine.beginDrain()
+    drainPromise = (async () => {
+      await groups.waitForDrain()
+      await engine.waitForDrain()
+    })()
+    return drainPromise
+  })
   kernel.services.provide("runtime.enqueue", ({ threadId, requestMessageId, trigger }) => {
+    if (draining) return { success: false, errorCode: "RUNTIME_DRAINING", error: "O servidor está encerrando." }
+
     const result = groups.enqueue({ threadId, requestMessageId, trigger })
     if (!result.success) return result
 
@@ -96,6 +122,7 @@ export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): P
   kernel.services.provide("approvals.present", engine.approvalBridge.present)
   kernel.services.provide("approvals.approve", engine.approvalBridge.approve)
   kernel.services.provide("approvals.settle", engine.approvalBridge.settle)
+  kernel.services.provide("approvals.completeTeam", engine.approvalBridge.completeTeam)
   kernel.services.provide("runtime.activeRun", ({ threadId }) => engine.activeRun({ threadId }))
   kernel.services.provide("runtime.continueAfterApproval", engine.continueAfterApproval)
   kernel.services.provide("runtime.cancelBotTurns", groups.cancelBotTurns)
@@ -103,10 +130,12 @@ export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): P
     const grouped = groups.cancel(runId)
     return engine.cancel(runId).success || grouped
   })
-  kernel.services.provide("runtime.shutdown", async () => {
+  kernel.services.provide("runtime.shutdown", async (options) => {
+    draining = true
     scheduler.stop()
-    groups.shutdown()
+    groups.shutdown(options)
     await engine.shutdown()
+    await groups.waitForDrain()
   })
   kernel.services.use("store.api")?.drainSendQueue?.()
 
@@ -138,7 +167,10 @@ export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): P
       {
         method: "GET",
         path: "/runs",
-        handler: async () => ({ status: 200, json: { runs: engine.getWorkRuns() } }),
+        handler: async () => ({
+          status: 200,
+          json: { runs: engine.getWorkRuns(), draining: kernel.services.use("runtime.isDraining")?.() ?? false },
+        }),
       },
       {
         method: "GET",
@@ -381,6 +413,7 @@ export const init = async (kernel: Kernel, runStage?: PerformanceStageRunner): P
   const approvalPrompt = createApprovalPromptHandler(engine)
   const registration = kernel.registerTools({
     tools: [
+      ...createTeamTools(kernel),
       { name: "coordinate_bots", group: "core", handler: ({ ctx, args }) => groups.askBot(ctx, args) },
       { name: "ask_all", group: "core", handler: ({ ctx, args }) => groups.askAll(ctx, args) },
       { name: "ask_bot", group: "core", handler: ({ ctx, args }) => groups.askBot(ctx, args) },

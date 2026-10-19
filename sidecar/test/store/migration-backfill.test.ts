@@ -6,7 +6,12 @@ import { join } from "node:path"
 import { createKernel } from "../../src/kernel"
 import { openDatabase, SCHEMA_VERSION } from "../../src/kernel/db"
 import { createEventBus } from "../../src/kernel/event-bus"
-import { backfillHistoryBatch, historyMigrationStatus, hydrateHistoryEvent } from "../../src/kernel/history-backfill"
+import {
+  backfillHistoryBatch,
+  historyMigrationStatus,
+  hydrateHistoryEvent,
+  startHistoryBackfill,
+} from "../../src/kernel/history-backfill"
 import { legacySourceRebuild } from "../../src/kernel/legacySourceRebuild"
 import baseSql from "../../src/kernel/migrations/0001.sql" with { type: "text" }
 import notificationsSql from "../../src/kernel/migrations/0002.sql" with { type: "text" }
@@ -36,6 +41,10 @@ import goalsSql from "../../src/kernel/migrations/0025.sql" with { type: "text" 
 import recoveryCenterSql from "../../src/kernel/migrations/0026.sql" with { type: "text" }
 import messageSearchSql from "../../src/kernel/migrations/0027.sql" with { type: "text" }
 import groupDeletionSql from "../../src/kernel/migrations/0028.sql" with { type: "text" }
+import computerGrantExpirySql from "../../src/kernel/migrations/0029.sql" with { type: "text" }
+import groupCoordinationHistorySql from "../../src/kernel/migrations/0030.sql" with { type: "text" }
+import streamWorkerStateSql from "../../src/kernel/migrations/0031.sql" with { type: "text" }
+import teamBuilderSql from "../../src/kernel/migrations/0032.sql" with { type: "text" }
 import { TRANSCRIPT_RETENTION } from "../../src/kernel/transcript-storage"
 import { init as initStore } from "../../src/store"
 
@@ -90,7 +99,8 @@ test("50k legacy rows serve before backfill, yield between bounded transactions 
     expect(health.historyMigration.total).toBe(50_000)
     const healthMs = performance.now() - started
     expect(healthMs).toBeLessThan(2000)
-    await Bun.sleep(60)
+    const deadline = Date.now() + 5000
+    while (!historyMigrationStatus(database).done && Date.now() < deadline) await Bun.sleep(10)
     const progress = historyMigrationStatus(database)
     expect(progress.done).toBeGreaterThan(0)
     expect(progress.done).toBeLessThan(50_000)
@@ -99,11 +109,13 @@ test("50k legacy rows serve before backfill, yield between bounded transactions 
     database = openDatabase({ filename: join(root, "touri.db") })
     expect(historyMigrationStatus(database)).toEqual(progress)
     let previous = progress.done
-    while (historyMigrationStatus(database).running) {
+    let passes = 0
+    while (historyMigrationStatus(database).running && passes < 2000) {
       const next = backfillHistoryBatch(database)
       expect(next.done - previous).toBeLessThanOrEqual(500)
-      expect(next.done).toBeGreaterThan(previous)
+      expect(next.done).toBeGreaterThanOrEqual(previous)
       previous = next.done
+      passes += 1
     }
     expect(backfillHistoryBatch(database)).toEqual({ running: false, done: 50_000, total: 50_000 })
     expect(database.query("SELECT COUNT(*) AS n, MIN(seq) AS first, MAX(seq) AS last FROM messages").get()).toEqual({
@@ -181,6 +193,44 @@ test("schema 11 answers health in under a second while a 2–5 MB history is bac
   }
 })
 
+test("history backfill yields and retries while another connection holds the write lock", async () => {
+  const root = mkdtempSync(join(tmpdir(), "touri-backfill-busy-"))
+  const filename = join(root, "touri.db")
+  let database: Database | undefined
+  let blocker: Database | undefined
+  let stop: (() => void) | undefined
+  let release: ReturnType<typeof setTimeout> | undefined
+  try {
+    legacyDatabase(root, 1, 1, 1)
+    database = openDatabase({ filename })
+    blocker = new Database(filename)
+    blocker.exec("BEGIN IMMEDIATE")
+    let timerFired = false
+    const startedAt = performance.now()
+    release = setTimeout(() => {
+      timerFired = true
+      blocker?.exec("ROLLBACK")
+    }, 200)
+    stop = startHistoryBackfill(database, () => {
+      throw new Error("Busy history backfill should retry without reporting an error")
+    })
+
+    const deadline = Date.now() + 2_000
+    while (historyMigrationStatus(database).running && Date.now() < deadline) await Bun.sleep(10)
+
+    expect(timerFired).toBe(true)
+    expect(performance.now() - startedAt).toBeLessThan(1_000)
+    expect(historyMigrationStatus(database)).toEqual({ running: false, done: 1, total: 1 })
+  } finally {
+    if (stop) stop()
+    if (release) clearTimeout(release)
+    if (blocker?.inTransaction) blocker.exec("ROLLBACK")
+    blocker?.close()
+    database?.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+}, 10_000)
+
 test("interrupted batches resume idempotently and match the shipped synchronous message projection and transcript", () => {
   const root = mkdtempSync(join(tmpdir(), "touri-migration-resume-"))
   let database: Database | undefined
@@ -220,6 +270,10 @@ test("interrupted batches resume idempotently and match the shipped synchronous 
     synchronous.exec(recoveryCenterSql)
     synchronous.exec(messageSearchSql)
     synchronous.exec(groupDeletionSql)
+    synchronous.exec(computerGrantExpirySql)
+    synchronous.exec(groupCoordinationHistorySql)
+    synchronous.exec(streamWorkerStateSql)
+    synchronous.exec(teamBuilderSql)
     database = openDatabase({ filename })
     expect(database.query("SELECT type, name, sql FROM sqlite_master ORDER BY name").all()).toEqual(
       synchronous.query("SELECT type, name, sql FROM sqlite_master ORDER BY name").all(),
@@ -235,7 +289,11 @@ test("interrupted batches resume idempotently and match the shipped synchronous 
     // An interruption inside a batch must roll back both rows and the marker.
     database.exec(`CREATE TRIGGER interrupt_batch BEFORE UPDATE OF seq ON messages
       WHEN NEW.id = 'm33' BEGIN SELECT RAISE(ABORT, 'quit mid-batch'); END`)
-    expect(() => backfillHistoryBatch(database as Database, 8)).toThrow("quit mid-batch")
+    const resumed = database
+    const resumeUntilWrite = () => {
+      for (let pass = 0; pass < 100; pass++) backfillHistoryBatch(resumed, 8)
+    }
+    expect(resumeUntilWrite).toThrow("quit mid-batch")
     expect(historyMigrationStatus(database)).toEqual(first)
     expect(database.query("SELECT COUNT(*) AS n FROM messages WHERE seq > 0").get()).toEqual({ n: 31 })
     database.exec("DROP TRIGGER interrupt_batch")

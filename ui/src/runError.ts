@@ -4,6 +4,7 @@ import {
   type FailureAction,
   failureRetryHint,
   failureStageLabel,
+  isModelAtCapacity,
   type RunFailureDetail,
   safeRunFailure,
   sanitizeDiagnostic,
@@ -30,6 +31,7 @@ const TITLES: Record<string, string> = {
   timeout: t("A execução demorou demais"),
   machine_service_unavailable: publicError("MACHINE_SERVICE_UNAVAILABLE").error,
   machine_service_start_failed: publicError("MACHINE_SERVICE_START_FAILED").error,
+  group_context_missing: t("O grupo ou a conversa não existe mais"),
   app_restart: t("A resposta foi interrompida ao reiniciar o touri"),
 }
 
@@ -51,7 +53,7 @@ const trustedAction = (action: FailureAction | undefined): FailureAction | undef
 /** A stored failure is data from storage: re-project it onto known phrases or sanitize it before display. */
 const trustedFailure = (errorClass: string, stored: RunFailureDetail): RunFailureDetail => {
   const projected = safeRunFailure(errorClass, stored.detail)
-  if (projected.stage !== "turn") return projected
+  if (projected.stage !== "turn" || isModelAtCapacity(projected.detail)) return projected
   const action = trustedAction(stored.action)
   return {
     stage: stored.stage,
@@ -62,6 +64,7 @@ const trustedFailure = (errorClass: string, stored: RunFailureDetail): RunFailur
 }
 
 const FALLBACK_TITLE = t("Não foi possível concluir a resposta")
+const ORPHANED_GROUP_TURN_PT = "O grupo ou a conversa não existe mais. Este turno não foi executado."
 
 /** Resolve old generic notices from the run already loaded with the thread; sanitize both sources. */
 export const runErrorFor = (message: Message, candidate?: Run, machineReady = false): RunErrorView | null => {
@@ -76,18 +79,29 @@ export const runErrorFor = (message: Message, candidate?: Run, machineReady = fa
   const failure =
     (stored && trustedFailure(errorClass, stored)) ?? fromRun ?? safeRunFailure(errorClass, legacyDiagnostic(raw))
   const { hint, ...rest } = failure
+  const modelIsAtCapacity = isModelAtCapacity(failure.detail)
+  const detail = modelIsAtCapacity ? t("O modelo selecionado está sem capacidade no momento.") : rest.detail
+  const recoveryHint = modelIsAtCapacity
+    ? t("Escolha outro modelo nas configurações do bot ou tente de novo em alguns minutos.")
+    : hint
   const apiMessage = Object.values(apiModelErrors).find((text) => (run?.errorMessage ?? raw).includes(text))
+  const getLocalizedDetail = (): string => {
+    if (run?.errorMessage === ORPHANED_GROUP_TURN_PT) return t(ORPHANED_GROUP_TURN_PT)
+    if (apiMessage) return t(apiMessage)
+
+    return detail
+  }
   return {
-    title: TITLES[errorClass] ?? FALLBACK_TITLE,
+    title: modelIsAtCapacity ? t("Modelo temporariamente sem capacidade") : (TITLES[errorClass] ?? FALLBACK_TITLE),
     ...rest,
-    detail: apiMessage ? t(apiMessage) : rest.detail,
+    detail: getLocalizedDetail(),
     code: publicError(errorClass).code,
     stageLabel: failureStageLabel(failure.stage),
     hint:
       machineReady && /^(?:machine_boot|sealed_connection)$/.test(failure.stage)
         ? failureRetryHint(failure.stage, true)
-        : (hint ?? failureRetryHint(failure.stage, machineReady)),
-    specificHint: hint !== undefined,
+        : (recoveryHint ?? failureRetryHint(failure.stage, machineReady)),
+    specificHint: recoveryHint !== undefined,
     recovery: errorRecovery(run?.errorMessage ?? raw, {
       errorClass,
       provider: run?.provider,

@@ -1,5 +1,6 @@
 import type { Database } from "bun:sqlite"
-import { expect, mock, test } from "bun:test"
+import { afterEach, expect, mock, spyOn, test } from "bun:test"
+import { EventEmitter } from "node:events"
 import {
   chmodSync,
   existsSync,
@@ -13,6 +14,7 @@ import {
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import type { ApprovalPart, Message, Run } from "@touri/contracts"
+import { registerServeShutdown } from "../../src/cli/serveShutdown"
 import { createKernel } from "../../src/kernel"
 import { init as initNotify } from "../../src/notify"
 import { createProjectStore } from "../../src/projects/repository"
@@ -35,13 +37,29 @@ const waitFor = async (predicate: () => boolean, timeout = 10_000): Promise<void
   }
 }
 
+const watchTimeout = (milliseconds: number) => {
+  const timeout = spyOn(globalThis, "setTimeout")
+  return {
+    calls: () => timeout.mock.calls.filter((args) => args[1] === milliseconds).length,
+    restore: () => timeout.mockRestore(),
+  }
+}
+
 const PAUSED = { pauseAfterFirstDelta: "release", ignoreInterrupt: true, deltas: ["INÍCIO", " meio", " FIM"] }
 
 /**
  * A fake Codex on a real store. `crash-once` makes the next provider process exit mid-turn;
  * every other turn follows scenario.json.
  */
-const fixture = async ({ resumeBackoffMs = 50 }: { resumeBackoffMs?: number } = {}) => {
+const fixture = async ({
+  resumeBackoffMs = 50,
+  maxConcurrentRuns,
+  disconnectEvents = false,
+}: {
+  resumeBackoffMs?: number
+  maxConcurrentRuns?: number
+  disconnectEvents?: boolean
+} = {}) => {
   const root = mkdtempSync(join(tmpdir(), "touri-resume-"))
   // Recovery fixtures must not depend on a provider reading touri's private data.
   const assets = mkdtempSync(join(tmpdir(), "touri-resume-provider-"))
@@ -75,18 +93,27 @@ exec '${process.execPath}' '${fake}' "$@"
   )
   const kernels: Array<Runtime> = []
   const engines: Array<Engine> = []
-  const open = async (options: { resumeBackoffMs?: number; routineTimeoutMs?: number } = {}) => {
+  const open = async (
+    options: {
+      resumeBackoffMs?: number
+      routineTimeoutMs?: number
+      maxConcurrentRuns?: number
+      disconnectEvents?: boolean
+    } = {},
+  ) => {
     const runtime = createKernel({ appData: root })
     runtime.kernel.spawnTree = fakeProviderSpawn(runtime.kernel.spawnTree, command, scenario)
     await initStore(runtime.kernel)
     await initNotify(runtime.kernel)
     kernels.push(runtime)
+    const engineKernel = options.disconnectEvents ? { ...runtime.kernel, subscribe: () => () => {} } : runtime.kernel
     const engine = createRuntimeEngine({
-      kernel: runtime.kernel,
+      kernel: engineKernel,
       codexCommand: command,
       environment: { PATH: process.env.PATH ?? "/usr/bin", TOURI_FAKE_SCENARIO: scenario },
       interruptGraceMs: 30,
       ...(options.resumeBackoffMs === undefined ? {} : { resumeBackoffMs: options.resumeBackoffMs }),
+      ...(options.maxConcurrentRuns === undefined ? {} : { maxConcurrentRuns: options.maxConcurrentRuns }),
       ...(options.routineTimeoutMs === undefined ? {} : { routineTimeoutMs: () => options.routineTimeoutMs ?? 0 }),
     })
     engines.push(engine)
@@ -94,7 +121,11 @@ exec '${process.execPath}' '${fake}' "$@"
     if (!store) throw new Error("Store missing")
     return { runtime, engine, store, db: runtime.kernel.db as Database }
   }
-  const first = await open({ resumeBackoffMs })
+  const first = await open({
+    resumeBackoffMs,
+    ...(maxConcurrentRuns === undefined ? {} : { maxConcurrentRuns }),
+    disconnectEvents,
+  })
   first.db.exec(`INSERT INTO bots(id,name,provider,home_dir,created_at,updated_at) VALUES ('b','Teste','codex','/tmp',1,1);
     INSERT INTO threads(id,bot_id,title,created_at,updated_at) VALUES ('t','b','Conversa',1,1);`)
   const send = (engine: Engine, text = "Tarefa longa", store = first.store): Run => {
@@ -167,7 +198,7 @@ exec '${process.execPath}' '${fake}' "$@"
     release: () => writeFileSync(join(assets, "release"), ""),
     close: async () => {
       for (const engine of engines.reverse()) await engine.shutdown()
-      for (const runtime of kernels.reverse()) runtime.stop()
+      for (const runtime of kernels.reverse()) await runtime.stop()
       rmSync(root, { recursive: true, force: true })
       rmSync(assets, { recursive: true, force: true })
     },
@@ -263,6 +294,197 @@ test("an approved folder write grant automatically continues with updated Codex 
     mock.module("../../src/runtime/folder-access", () => original)
   }
 }, 30_000)
+
+const drainCleanups: Array<() => Promise<void>> = []
+afterEach(async () => {
+  for (const cleanup of drainCleanups.splice(0)) await cleanup()
+})
+
+test.each(["active", "completion"] as const)("approval continuation survives drain during %s", async (at) => {
+  const f = await fixture()
+  drainCleanups.push(f.close)
+  f.disableResume()
+  const run = f.send(f.first.engine)
+  await waitFor(f.streamed("INÍCIO"))
+  expect(
+    f.first.engine.continueAfterApproval({
+      botId: "b",
+      threadId: "t",
+      runId: run.id,
+      signal: new AbortController().signal,
+    }),
+  ).toBe(true)
+  const unsubscribe = f.first.runtime.kernel.subscribe(({ event }) => {
+    if (
+      at === "completion" &&
+      event.type === "run.updated" &&
+      event.run.id === run.id &&
+      event.run.status === "succeeded"
+    )
+      f.first.engine.beginDrain()
+  })
+  drainCleanups.push(async () => unsubscribe())
+
+  if (at === "active") f.first.engine.beginDrain()
+  f.writeScenario({ deltas: ["Tarefa aprovada concluída."] })
+  f.release()
+  await f.first.engine.waitForDrain()
+
+  expect(f.runs()).toHaveLength(2)
+  expect(f.runs().every((attempt) => attempt.status === "succeeded")).toBe(true)
+  expect(f.links()).toMatchObject([{ previous_run_id: run.id, reason: "permission_granted" }])
+})
+
+test("drain waits for continuation events and returns promptly after the last run finishes", async () => {
+  const f = await fixture({ resumeBackoffMs: 250 })
+  drainCleanups.push(f.close)
+  f.writeScenario({ deltas: ["Retomada concluída."] })
+  f.crashOnce()
+  f.send(f.first.engine)
+  await waitFor(() => f.runs()[0]?.status === "failed")
+  f.first.engine.beginDrain()
+  let lastRunFinishedAt = 0
+  const unsubscribe = f.first.runtime.kernel.subscribe(({ event }) => {
+    if (event.type === "run.updated" && event.run.status === "succeeded") lastRunFinishedAt = performance.now()
+  })
+  drainCleanups.push(async () => unsubscribe())
+  const timeoutWatch = watchTimeout(10)
+  drainCleanups.push(async () => timeoutWatch.restore())
+
+  await f.first.engine.waitForDrain()
+  timeoutWatch.restore()
+
+  expect(f.runs()).toHaveLength(2)
+  expect(f.runs()).toMatchObject([{ status: "failed" }, { status: "succeeded" }])
+  expect(timeoutWatch.calls()).toBe(0)
+  expect(lastRunFinishedAt).toBeGreaterThan(0)
+  expect(performance.now() - lastRunFinishedAt).toBeLessThan(100)
+})
+
+test("drain reacts to engine run saves without a kernel event subscription", async () => {
+  const f = await fixture({ maxConcurrentRuns: 1, disconnectEvents: true })
+  drainCleanups.push(f.close)
+  const first = f.send(f.first.engine)
+  await waitFor(f.streamed("INÍCIO"))
+  const continuation = f.send(f.first.engine, "Continue a tarefa")
+  f.first.db
+    .query(
+      "INSERT INTO run_continuations (run_id, original_run_id, previous_run_id, reason, created_at) VALUES (?, ?, ?, ?, ?)",
+    )
+    .run(continuation.id, first.id, first.id, "provider_crash", Date.now())
+  f.first.engine.beginDrain()
+  f.writeScenario({ deltas: ["As duas tarefas terminaram."] })
+  f.release()
+  const drain = await Promise.race([f.first.engine.waitForDrain().then(() => true), Bun.sleep(1_500).then(() => false)])
+
+  expect(drain).toBe(true)
+  expect(f.runs()).toMatchObject([{ status: "succeeded" }, { status: "succeeded" }])
+})
+
+test("drain returns after a bounded wait when a drainable queued run is missing", async () => {
+  const f = await fixture({ maxConcurrentRuns: 1 })
+  drainCleanups.push(f.close)
+  const first = f.send(f.first.engine)
+  await waitFor(f.streamed("INÍCIO"))
+  const queued = f.send(f.first.engine, "Tarefa na fila")
+  f.first.db
+    .query(
+      "INSERT INTO run_continuations (run_id, original_run_id, previous_run_id, reason, created_at) VALUES (?, ?, ?, ?, ?)",
+    )
+    .run(queued.id, first.id, first.id, "provider_crash", Date.now())
+  f.first.db.exec("PRAGMA foreign_keys = OFF")
+  f.first.db.query("DELETE FROM runs WHERE id = ?").run(queued.id)
+  f.first.db.exec("PRAGMA foreign_keys = ON")
+  f.first.engine.beginDrain()
+  f.writeScenario({ deltas: ["A tarefa ativa terminou."] })
+  f.release()
+  const drain = await Promise.race([f.first.engine.waitForDrain().then(() => true), Bun.sleep(1_500).then(() => false)])
+
+  expect(drain).toBe(true)
+  expect(f.runs()).toMatchObject([{ id: first.id, status: "succeeded" }])
+})
+
+test("shutdown preserves a pending permission continuation even with automatic recovery disabled", async () => {
+  const f = await fixture()
+  drainCleanups.push(f.close)
+  f.disableResume()
+  const run = f.send(f.first.engine)
+  await waitFor(f.streamed("INÍCIO"))
+  expect(
+    f.first.engine.continueAfterApproval({
+      botId: "b",
+      threadId: "t",
+      runId: run.id,
+      signal: new AbortController().signal,
+    }),
+  ).toBe(true)
+  const stopped = Promise.withResolvers<void>()
+  const unsubscribe = f.first.runtime.kernel.subscribe(({ event }) => {
+    if (event.type !== "run.updated" || event.run.id !== run.id || event.run.status !== "succeeded") return
+
+    queueMicrotask(() => {
+      void f.first.engine.shutdown().then(stopped.resolve, stopped.reject)
+    })
+  })
+  drainCleanups.push(async () => unsubscribe())
+
+  f.writeScenario({ deltas: ["Tarefa autorizada concluída."] })
+  f.release()
+  await stopped.promise
+
+  expect(f.runs()).toMatchObject([{ id: run.id, status: "succeeded" }, { status: "queued" }])
+  await f.open()
+  await waitFor(() => f.runs()[1]?.status === "succeeded")
+  expect(f.links()).toMatchObject([{ previous_run_id: run.id, reason: "permission_granted" }])
+})
+
+test("shutdown persists a pending continuation and restart executes it", async () => {
+  const f = await fixture({ resumeBackoffMs: 60_000 })
+  drainCleanups.push(f.close)
+  f.writeScenario({ deltas: ["Tarefa retomada."] })
+  f.crashOnce()
+  const run = f.send(f.first.engine)
+  await waitFor(() => f.runs()[0]?.status === "failed")
+
+  f.first.engine.beginDrain()
+  await f.first.engine.shutdown()
+
+  expect(f.runs()).toMatchObject([{ id: run.id, status: "failed" }, { status: "queued" }])
+  await f.open()
+  await waitFor(() => f.runs()[1]?.status === "succeeded")
+  expect(f.links()).toMatchObject([{ previous_run_id: run.id, reason: "provider_crash" }])
+})
+
+test("serve deadline interrupts an active turn and restart safely resumes its session", async () => {
+  const f = await fixture()
+  drainCleanups.push(f.close)
+  const run = f.send(f.first.engine)
+  await waitFor(f.streamed("INÍCIO"))
+  const signals = new EventEmitter()
+  const exited = Promise.withResolvers<number>()
+  registerServeShutdown({
+    drainTimeoutMs: 20,
+    beginDrain: () => {
+      f.first.engine.beginDrain()
+      return f.first.engine.waitForDrain()
+    },
+    shutdown: f.first.engine.shutdown,
+    finish: async () => {},
+    log: f.first.runtime.kernel.log,
+    signals,
+    exit: exited.resolve,
+  })
+
+  signals.emit("SIGTERM")
+  expect(await exited.promise).toBe(0)
+
+  expect(f.runs()[0]).toMatchObject({ id: run.id, status: "interrupted", error_class: "app_restart" })
+  f.writeScenario({ deltas: ["Retomada segura concluída."] })
+  await f.open()
+  await waitFor(() => f.runs()[1]?.status === "succeeded")
+  expect(f.links()).toMatchObject([{ previous_run_id: run.id, reason: "app_restart" }])
+  expect(f.frames().filter((frame) => frame.method === "thread/resume")).toHaveLength(1)
+})
 
 test("app restart continues an interrupted turn in the same provider session", async () => {
   const f = await fixture()
@@ -469,6 +691,7 @@ test("a turn interrupted by quitting touri is continued when it reopens", async 
   try {
     const original = f.send(f.first.engine)
     await waitFor(f.streamed("INÍCIO"))
+    f.first.engine.beginDrain()
     await f.first.engine.shutdown()
     expect(f.runs()[0]).toMatchObject({ status: "interrupted", error_class: "app_restart" })
     f.writeScenario({ deltas: ["Retomei."] })
@@ -541,6 +764,8 @@ test("uncertain work effects block the automatic continuation", async () => {
     const work = createWorkState({ database: f.first.db })
     work.beginEffect({ turnId: run.id, threadId: "t", key: "process:web", description: "web", effectId: "effect-1" })
     work.recover({ observe: () => ({ kind: "unobservable", reason: "exit not observed before restart" }) })
+    f.first.engine.beginDrain()
+    await f.first.engine.shutdown()
     await f.open()
     await Bun.sleep(300)
     expect(f.runs()).toEqual([expect.objectContaining({ id: run.id, status: "interrupted" })])

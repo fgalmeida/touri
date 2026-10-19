@@ -3,6 +3,29 @@ import { expect, test } from "@playwright/test"
 test.use({ channel: "chromium", timezoneId: "UTC" })
 test.setTimeout(60_000)
 
+for (const [name, width, height, theme] of [
+  ["desktop-light", 1440, 900, "light"],
+  ["desktop-dark", 1440, 900, "dark"],
+  ["phone-light", 390, 844, "light"],
+  ["phone-dark", 390, 844, "dark"],
+] as const) {
+  test(`routine sidebar preview hides the no-news marker · ${name}`, async ({ page }) => {
+    const phone = width === 390
+    await page.setViewportSize({ width, height })
+    await page.emulateMedia({ reducedMotion: "reduce", colorScheme: theme })
+    await page.addInitScript((appearance) => localStorage.setItem("touri.appearance.v1", appearance), theme)
+    await page.goto("/?mockScenario=routine-conversation")
+
+    await expect(page.getByRole("textbox", { name: "Mensagem para mark" })).toBeVisible()
+    if (phone) await page.getByRole("button", { name: "Abrir menu", exact: true }).click()
+    const preview = page.locator('[data-bot-entry="bot-mark"] .bot-preview')
+    await expect(preview).toHaveText("Sem novidades nesta execução")
+    await expect(preview).not.toContainText("NO_NOTIFICATION")
+    await expect(preview).toHaveAttribute("title", "Sem novidades nesta execução")
+    if (phone) await page.getByRole("button", { name: "Fechar menu", exact: true }).click()
+  })
+}
+
 const appearances = ["dark", "light", "mobile", "expanded"]
 
 for (const appearance of appearances) {
@@ -26,7 +49,9 @@ for (const appearance of appearances) {
 
     await expect(instructions).toHaveAttribute("aria-expanded", "false")
     await expect(page.locator(".message-routine-prompt .disclosure-reveal")).toHaveAttribute("aria-hidden", "true")
-    await expect(page.getByText("Sem novidades nesta execução", { exact: true })).toBeVisible()
+    await expect(
+      page.getByTestId("virtual-message-list").getByText("Sem novidades nesta execução", { exact: true }),
+    ).toBeVisible()
     await expect(page.getByText("NO_NOTIFICATION", { exact: true })).toHaveCount(0)
     await expect(schedule).toHaveCount(0)
     await expect(page.locator(".routine-run-marker")).toContainText("Resumo da caixa de entrada")

@@ -13,6 +13,22 @@ const openGroupPanel = (name: string): HTMLElement => {
 }
 
 describe("Grupos", () => {
+  it("keeps an empty group list to one compact create action", async () => {
+    const api = createMockApi()
+    render(<App kernel={{ services: { api } }} />)
+    await screen.findByRole("textbox", { name: "Mensagem para mark" })
+
+    const groups = screen.getByRole("region", { name: "Grupos" })
+    const createGroup = within(groups).getByRole("button", { name: "Criar grupo" })
+    expect(createGroup).toBeVisible()
+    expect(groups.querySelector(".group-sidebar-heading")).toBeNull()
+    expect(within(groups).queryByText("Reúna seus bots em uma conversa.")).toBeNull()
+
+    fireEvent.click(createGroup)
+
+    expect(screen.getByRole("dialog", { name: "Criar grupo" })).toBeVisible()
+  })
+
   it("F026: exposes every mention and announces arrow selection", async () => {
     const user = userEvent.setup()
     const api = createMockApi()
@@ -23,7 +39,7 @@ describe("Grupos", () => {
     await api.request("POST /groups", {
       name: "Equipe QA",
       color: "#dc2626",
-      avatarShape: "cercle",
+      avatarShape: "classic-none",
       memberIds: [first.id, second.id],
       coordinatorBotId: first.id,
     })
@@ -65,7 +81,7 @@ describe("Grupos", () => {
     await api.request("POST /groups", {
       name: "Produto",
       color: "#dc2626",
-      avatarShape: "cercle",
+      avatarShape: "classic-none",
       memberIds: ["bot-mark", "bot-onb"],
       coordinatorBotId: "bot-mark",
     })
@@ -96,7 +112,7 @@ describe("Grupos", () => {
     await api.request("POST /groups", {
       name: "Equipe QA",
       color: "#dc2626",
-      avatarShape: "cercle",
+      avatarShape: "classic-none",
       memberIds: ["bot-mark", "bot-onb"],
       coordinatorBotId: null,
     })
@@ -166,7 +182,7 @@ describe("Grupos", () => {
     const created = await api.request("POST /groups", {
       name: "Equipe",
       color: "#dc2626",
-      avatarShape: "cercle",
+      avatarShape: "classic-none",
       memberIds: ["bot-mark", "bot-onb"],
       coordinatorBotId: "bot-mark",
     })

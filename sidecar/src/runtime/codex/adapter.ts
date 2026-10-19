@@ -12,6 +12,7 @@ import type {
 import { redactToolText } from "@touri/contracts/redaction"
 import { codexApprovalPayload } from "../../approvals/payload"
 import { buildChildEnv } from "../../kernel"
+import type { PerformanceStageRunner } from "../../kernel/performance"
 import { redactStructured } from "../../kernel/redact"
 import { touriVersion } from "../../version"
 import { createCommandOutput } from "../command-output"
@@ -231,10 +232,12 @@ export const createCodexAdapter = ({
   kernel,
   command,
   interruptGraceMs = 2_000,
+  runStage,
 }: {
   kernel: Kernel
   command?: string
   interruptGraceMs?: number
+  runStage?: PerformanceStageRunner
 }): ProviderAdapter => {
   const commandName = command ?? process.env.TOURI_CODEX_BIN ?? "codex"
   const approvals = new Map<string, PendingApproval>()
@@ -377,15 +380,20 @@ export const createCodexAdapter = ({
       complete({ success: false, errorCode: "cli_crash", error: message })
       return true
     }
+    const parseFrame = (line: string): unknown => JSON.parse(line)
     const onLine = (line: string): void => {
       if (completed) return
       let parsed: unknown
       try {
-        parsed = JSON.parse(line) as unknown
+        parsed = runStage ? runStage("provider_frame_json_parse", parseFrame, line) : parseFrame(line)
       } catch {
         complete({ success: false, errorCode: "cli_protocol", error: "Malformed Codex JSON frame" })
         return
       }
+      if (runStage) runStage("provider_frame_route", routeFrame, parsed)
+      else routeFrame(parsed)
+    }
+    const routeFrame = (parsed: unknown): void => {
       const response = responseRecord(parsed)
       if (response) {
         const waiter = responseWaiters.get(response.id)
@@ -573,8 +581,9 @@ export const createCodexAdapter = ({
     }
     const stopReader = startLineReader({
       stream: spawned.stdout,
-      onLine,
+      onLine: (line) => (runStage ? runStage("provider_frame_dispatch", onLine, line) : onLine(line)),
       onError: (error) => complete({ success: false, errorCode: "cli_protocol", error: error.message }),
+      ...(runStage ? { runStage } : {}),
     })
     const stderrOutput = readProviderStderr(spawned.stderr, (text) => {
       if (recoverSandbox(text)) return
