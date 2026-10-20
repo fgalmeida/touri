@@ -1,10 +1,15 @@
-import type { Database } from "bun:sqlite"
-import { expect, spyOn, test } from "bun:test"
+import { Database } from "bun:sqlite"
+import { afterEach, expect, spyOn, test } from "bun:test"
 import { mkdtempSync, realpathSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import type { Message, MessagePart, ProviderAdapter, ProviderEvent, StartTurnArgs, UiEvent } from "@touri/contracts"
 import { createKernel } from "../../src/kernel"
+import {
+  createPerformanceStageTracker,
+  type PerformanceStage,
+  type PerformanceStageRunner,
+} from "../../src/kernel/performance"
 import { createRedactor } from "../../src/kernel/redact"
 import { createRuntimeEngine } from "../../src/runtime/engine"
 import { turnConclusion } from "../../src/runtime/turn-conclusion"
@@ -13,10 +18,21 @@ import { redactVmEvents } from "../../src/vm/redact-events"
 
 const changed: MessagePart = { type: "file_change", callId: "write", paths: ["notas.md"], diff: null }
 const preamble = "Vou criar o arquivo."
+const cleanups = new Set<() => Promise<void>>()
+
+afterEach(async () => {
+  for (const cleanup of cleanups) await cleanup()
+  cleanups.clear()
+})
 
 const fixture = async (
   script: (args: StartTurnArgs) => Promise<void>,
   requestText = "Crie notas.md com três ideias.",
+  options: {
+    cancelAt?: PerformanceStage
+    beforeFinalization?: (database: Database) => void
+    afterStage?: (stage: PerformanceStage) => void
+  } = {},
 ) => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "touri-conclusion-")))
   const serve = spyOn(Bun, "serve").mockReturnValue({
@@ -46,7 +62,25 @@ const fixture = async (
     answerApproval: async () => ({ success: true }),
     shutdown: async () => {},
   }
-  const engine = createRuntimeEngine({ kernel: runtime.kernel, providerAdapters: { codex: adapter } })
+  let didCancel = false
+  const stages = createPerformanceStageTracker()
+  const runStage: PerformanceStageRunner = (stage, action, input) => {
+    if (stage === "runtime_turn_finalization") options.beforeFinalization?.(db)
+    const result = stages.run(stage, action, input)
+    options.afterStage?.(stage)
+    if (stage === options.cancelAt && !didCancel) {
+      didCancel = true
+      queueMicrotask(() => {
+        if (queued.success) engine.cancel(queued.run.id)
+      })
+    }
+    return result
+  }
+  const engine = createRuntimeEngine({
+    kernel: runtime.kernel,
+    providerAdapters: { codex: adapter },
+    ...(options.cancelAt || options.beforeFinalization || options.afterStage ? { runStage } : {}),
+  })
   const store = runtime.kernel.services.use("store.api")
   if (!store) throw new Error("Store missing")
   const events: UiEvent[] = []
@@ -76,7 +110,7 @@ const fixture = async (
     finish: async () => {
       // A fresh kernel loads the login shell environment on its first turn; that takes seconds on macOS.
       const deadline = Date.now() + 15_000
-      while (queued.run.status !== "succeeded") {
+      while (["queued", "starting", "running"].includes(queued.run.status)) {
         if (Date.now() > deadline) throw new Error("Turn did not finish")
         await Bun.sleep(5)
       }
@@ -87,8 +121,183 @@ const fixture = async (
     close: async () => {
       unsubscribe()
       await engine.shutdown()
-      runtime.stop()
+      await runtime.stop()
       rmSync(root, { recursive: true, force: true })
+    },
+  }
+}
+
+test.each(["runtime_part_finalization", "runtime_output_preparation"] as const)(
+  "cancellation during %s wins over a successful provider completion",
+  async (stage) => {
+    const f = await fixture(
+      async ({ onEvent }) => {
+        onEvent({
+          type: "item",
+          part: {
+            type: "command",
+            callId: "shell",
+            command: "sample",
+            cwd: "/workspace",
+            exitCode: null,
+            outputTail: "partial",
+          },
+        })
+      },
+      "Conclua a tarefa.",
+      { cancelAt: stage },
+    )
+    cleanups.add(f.close)
+
+    const reply = await f.finish()
+
+    expect(reply.status).toBe("canceled")
+    expect(reply.parts.find((part) => part.type === "command")).toMatchObject({
+      resolution: "cancelled_by_user",
+      outputTail: "partial",
+    })
+    expect(f.db.query("SELECT status FROM runs").all()).toEqual([{ status: "canceled" }])
+  },
+)
+
+test.each(["runtime_part_finalization", "runtime_output_preparation"] as const)(
+  "cancellation during failed-turn %s externalizes output before the terminal write",
+  async (stage) => {
+    const output = "synthetic output\n".repeat(768)
+    const f = await fixture(
+      async ({ onEvent }) => {
+        onEvent({
+          type: "item",
+          part: {
+            type: "command",
+            callId: "shell",
+            command: "sample",
+            cwd: "/workspace",
+            exitCode: null,
+            outputTail: output,
+          },
+        })
+        onEvent({ type: "turn_completed", status: "failed", errorClass: "tool_error", errorMessage: "Fixture failure" })
+      },
+      "Conclua a tarefa.",
+      { cancelAt: stage },
+    )
+    cleanups.add(f.close)
+    // The terminal preparation must not depend on a streaming store externalizing its patches.
+    const append = spyOn(f.store, "appendParts").mockImplementation(() => {})
+    const update = spyOn(f.store, "updateMessage")
+    cleanups.add(async () => {
+      append.mockRestore()
+      update.mockRestore()
+    })
+
+    const reply = await f.finish()
+
+    const terminal = update.mock.calls.find(([input]) => input.patch.status !== "streaming")?.[0]
+    const command = terminal?.patch.parts?.find((part) => part.type === "command")
+    expect(command).toMatchObject({
+      outputTail: "",
+      outputBytes: Buffer.byteLength(output),
+    })
+    if (command?.type !== "command" || !command.outputAttachmentId) throw new Error("Output reference missing")
+    const attachment = f.db.query("SELECT path FROM attachments WHERE id = ?").get(command.outputAttachmentId) as {
+      path: string
+    } | null
+    if (!attachment) throw new Error("Output attachment missing")
+    expect(await Bun.file(attachment.path).text()).toBe(output)
+    expect(reply.parts).toContainEqual(command)
+    const stored = f.db.query("SELECT part_json FROM tool_resolutions WHERE call_id = 'shell'").get() as {
+      part_json: string
+    } | null
+    expect(stored ? JSON.parse(stored.part_json) : null).toEqual(command)
+  },
+)
+
+test.each(["runtime_part_finalization", "runtime_output_preparation"] as const)(
+  "a late part during %s survives preparation with its complete output",
+  async (stage) => {
+    const output = "late synthetic result\n".repeat(768)
+    let sendEvent: StartTurnArgs["onEvent"] | null = null
+    let didSend = false
+    const f = await fixture(
+      async ({ onEvent }) => {
+        sendEvent = onEvent
+        onEvent({ type: "text_delta", itemId: "reply", delta: "Resultado parcial." })
+      },
+      "Conclua a tarefa.",
+      {
+        afterStage: (current) => {
+          if (current !== stage || didSend) return
+          didSend = true
+          queueMicrotask(() => {
+            sendEvent?.({
+              type: "item",
+              part: {
+                type: "command",
+                callId: "late",
+                command: "sample",
+                cwd: "/workspace",
+                exitCode: 0,
+                outputTail: output,
+              },
+            })
+          })
+        },
+      },
+    )
+    cleanups.add(f.close)
+
+    const reply = await f.finish()
+
+    expect(reply.status).toBe("complete")
+    const part = reply.parts.find((part) => part.type === "command" && part.callId === "late")
+    expect(part).toMatchObject({ outputTail: "", outputBytes: Buffer.byteLength(output), resolution: "succeeded" })
+    if (part?.type !== "command" || !part.outputAttachmentId) throw new Error("Output reference missing")
+    const attachment = f.db.query("SELECT path FROM attachments WHERE id = ?").get(part.outputAttachmentId) as {
+      path: string
+    } | null
+    if (!attachment) throw new Error("Output attachment missing")
+    expect(await Bun.file(attachment.path).text()).toBe(output)
+  },
+)
+
+test("finalization yields while another connection holds the writer instead of blocking timers", async () => {
+  const blocker = getWriterBlocker()
+  cleanups.add(blocker.close)
+  const f = await fixture(async () => {}, "Conclua a tarefa.", { beforeFinalization: blocker.hold })
+  cleanups.add(f.close)
+
+  const reply = await f.finish()
+
+  console.info(
+    `finalization-writer-contention ${JSON.stringify({ timerDelayMs: blocker.getReleaseDelayMs(), status: reply.status })}`,
+  )
+  expect(blocker.getReleaseDelayMs()).toBeLessThan(50)
+  expect(reply.status).toBe("complete")
+})
+
+const getWriterBlocker = () => {
+  let writer: Database | null = null
+  let timer: ReturnType<typeof setTimeout> | null = null
+  let releaseDelayMs = Infinity
+
+  return {
+    hold: (database: Database): void => {
+      if (writer) return
+      writer = new Database(database.filename)
+      database.exec("PRAGMA busy_timeout = 120")
+      writer.exec("BEGIN IMMEDIATE")
+      const startedAt = performance.now()
+      timer = setTimeout(() => {
+        releaseDelayMs = performance.now() - startedAt
+        writer?.exec("ROLLBACK")
+      }, 15)
+    },
+    getReleaseDelayMs: () => releaseDelayMs,
+    close: async (): Promise<void> => {
+      if (timer) clearTimeout(timer)
+      if (writer?.inTransaction) writer.exec("ROLLBACK")
+      writer?.close()
     },
   }
 }
