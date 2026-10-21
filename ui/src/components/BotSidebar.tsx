@@ -17,6 +17,7 @@ import { reconcileApprovalMessages } from "../approvalState"
 import { BOT_ACTIVITY_LABELS, type BotActivity } from "../botActivity"
 import { latestPreview } from "../botPreview"
 import { ApiError } from "../errors"
+import { getChannelWorking } from "../features/channelBrowser/channelBrowserModel"
 import { paletteShortcutLabel } from "../features/commandPalette/shortcut"
 import { getRoutineRunCountsToday, getRoutineRunDateLabel, getRoutineRunSidebarDateLabel, t } from "../i18n"
 import { isRoutineConversation } from "../routineConversation"
@@ -171,6 +172,7 @@ export const Sidebar = (props: SidebarProps) => {
     () => reconcileApprovalMessages(props.messages, props.notifications),
     [props.messages, props.notifications],
   )
+  const channelWorking = useMemo(() => getChannelWorking(props.threads, messages), [props.threads, messages])
   const notifications = useMemo(
     () => reconcileFailureNotifications(props.notifications, props.runs ?? []),
     [props.notifications, props.runs],
@@ -350,6 +352,7 @@ export const Sidebar = (props: SidebarProps) => {
           groups={props.groups ?? []}
           bots={props.bots}
           threads={props.threads}
+          channelWorking={channelWorking}
           selectedThreadId={props.selectedThreadId}
           onSelect={selectThread}
           onCreate={() => navigate(() => props.onNewGroup?.())}

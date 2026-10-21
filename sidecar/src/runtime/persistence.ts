@@ -84,6 +84,9 @@ export const toRun = (value: unknown): Run | null => {
   if (!row) return null
   return {
     id: text(row, "id"),
+    requesterPersonId: nullableText(row, "requester_person_id"),
+    ...("browser_request_id" in row ? { browserRequestId: nullableText(row, "browser_request_id") } : {}),
+    ...(row.browser_waiting_for_person ? { browserWaitingForPerson: true } : {}),
     threadId: text(row, "thread_id"),
     botId: text(row, "bot_id"),
     provider: text(row, "provider") as Run["provider"],
@@ -203,6 +206,8 @@ const canUseDatabase = (value: unknown): value is Database => {
 }
 
 const RUN_SNAPSHOT_SELECT = `SELECT r.*, COALESCE(root.thread_id, t.group_thread_id) AS group_thread_id,
+  COALESCE(browser_continuation.original_run_id, r.id) AS browser_request_id,
+  EXISTS(SELECT 1 FROM browser_pending_handoffs handoff WHERE handoff.run_id IN (r.id, browser_continuation.original_run_id) AND handoff.state = 'waiting') AS browser_waiting_for_person,
   browser_continuation.previous_run_id AS browser_takeover_from_run_id,
   CASE
     WHEN continuation.run_id IS NOT NULL OR browser_continuation.run_id IS NOT NULL THEN 'resume'
@@ -365,12 +370,13 @@ export const createRuntimePersistence = ({ database }: { database: unknown }): R
     const error = getPersistedRunError(run)
     const result = db
       .query(
-        `INSERT INTO runs (id, thread_id, bot_id, provider, trigger, request_message_id, reply_message_id, external_turn_id, status, error_class, error_message, usage_json, routine_run_id, queued_at, started_at, finished_at, provider_started_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO runs (id, thread_id, bot_id, provider, trigger, request_message_id, reply_message_id, external_turn_id, status, error_class, error_message, usage_json, routine_run_id, queued_at, started_at, finished_at, provider_started_at, requester_person_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET request_message_id=excluded.request_message_id, reply_message_id=excluded.reply_message_id,
          external_turn_id=excluded.external_turn_id, status=excluded.status, error_class=excluded.error_class,
          error_message=excluded.error_message, usage_json=excluded.usage_json, routine_run_id=excluded.routine_run_id,
-         queued_at=excluded.queued_at, started_at=excluded.started_at, finished_at=excluded.finished_at, provider_started_at=excluded.provider_started_at
+         queued_at=excluded.queued_at, started_at=excluded.started_at, finished_at=excluded.finished_at, provider_started_at=excluded.provider_started_at,
+         requester_person_id=excluded.requester_person_id
          WHERE runs.status IN ('queued', 'starting', 'running')`,
       )
       .run(
@@ -391,6 +397,7 @@ export const createRuntimePersistence = ({ database }: { database: unknown }): R
         run.startedAt,
         run.finishedAt,
         run.providerStartedAt ?? null,
+        run.requesterPersonId ?? null,
       )
     if (result.changes === 0) return false
     const current = runs.get(run.id)

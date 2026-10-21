@@ -39,3 +39,29 @@ test("permission continuation migration preserves existing links across upgrades
     rmSync(root, { recursive: true, force: true })
   }
 })
+
+test("browser handback continuation reason survives database reopen", () => {
+  const root = mkdtempSync(join(tmpdir(), "touri-browser-continuation-migration-"))
+  const filename = join(root, "test.db")
+  let db = openDatabase({ filename })
+  try {
+    db.exec(`
+      INSERT INTO bots(id,name,provider,home_dir,created_at,updated_at) VALUES ('b','Test','codex','/tmp',1,1);
+      INSERT INTO threads(id,bot_id,title,created_at,updated_at) VALUES ('t','b','Test',1,1);
+      INSERT INTO runs(id,thread_id,bot_id,provider,trigger,status,queued_at) VALUES
+        ('original','t','b','codex','user','succeeded',1),
+        ('resumed','t','b','codex','retry','succeeded',2);
+      INSERT INTO browser_takeover_continuations VALUES ('resumed','original','original',3);
+    `)
+    db.close()
+    db = openDatabase({ filename })
+
+    expect(
+      db.query("SELECT run_id, original_run_id, previous_run_id FROM browser_takeover_continuations").all(),
+    ).toEqual([{ run_id: "resumed", original_run_id: "original", previous_run_id: "original" }])
+    expect(db.query("PRAGMA foreign_key_check").all()).toEqual([])
+  } finally {
+    db.close()
+    rmSync(root, { recursive: true, force: true })
+  }
+})

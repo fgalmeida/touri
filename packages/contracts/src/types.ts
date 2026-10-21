@@ -293,8 +293,13 @@ export type RunUsage = {
 }
 
 export type Run = {
+  /** Stable browser request across private handback continuations. Derived from the continuation ledger. */
+  browserRequestId?: Id | null
+  browserWaitingForPerson?: boolean
   /** Group projection only: persisted association lives in group_run_links. */
   groupTurnId?: Id
+  /** The person whose message started this shared-channel run, if it came from Work. */
+  requesterPersonId?: Id | null
   id: Id
   threadId: Id
   /** Visible group conversation; threadId always identifies the actual execution thread. */
@@ -679,6 +684,7 @@ export type BrowserErrorCode =
   | 'REPEATED_FAILURE'
   | 'USER_TAKEOVER_REQUIRED'
   | 'SECRET_ENTRY_ACTIVE'
+  | 'PRIVATE_TAKEOVER_ACTIVE'
   | 'ENGINE_UNAVAILABLE'
   | 'LOCAL_BROWSER_UNAVAILABLE'
   | 'NAVIGATION_FAILED'
@@ -689,6 +695,8 @@ export type BrowserErrorCode =
 /** The latest failed browser tool call of a bot, shown where the screen would otherwise stay empty. */
 export type BrowserFailureInfo = { tool: string; errorCode: string; error: string; at: EpochMs }
 
+export type BrowserTakeoverReason = "login" | "payment" | "form_submit" | "sensitive_action" | "requested"
+
 export type BrowserTabInfo = {
   tabId: Id
   url: string
@@ -696,10 +704,59 @@ export type BrowserTabInfo = {
   state: 'live' | 'unloaded' | 'closed'
   openerTabId: Id | null
   heldByUser: boolean
+  takeoverReason?: BrowserTakeoverReason | null
   takeoverRequested?: boolean
   takeoverRunId?: Id | null
   lastUsedAt: EpochMs
 }
+
+export type BrowserChannelRunStatus =
+  | 'queued'
+  | 'running'
+  | 'needs_you'
+  | 'taken_over'
+  | 'succeeded'
+  | 'failed'
+  | 'canceled'
+
+/** Shared-channel browser work shown in workspace activity and live events. */
+export type BrowserChannelRun = {
+  runId: Id
+  groupId: Id
+  threadId: Id
+  botId: Id
+  requesterPersonId: Id | null
+  requesterName: string | null
+  responsiblePersonId: Id | null
+  controllerPersonId: Id | null
+  controllerName: string | null
+  status: BrowserChannelRunStatus
+  queuePosition: number | null
+  queuedAt: EpochMs
+  startedAt: EpochMs | null
+  needsYouAt: EpochMs | null
+  escalatedAt: EpochMs | null
+  finishedAt: EpochMs | null
+}
+
+export type BrowserTakeoverFrame = {
+  controlEpoch: string
+  targetEpoch: number
+  viewEpoch: number
+  title: string
+  url: string
+  image: string
+  width: number
+  height: number
+}
+
+export type BrowserTakeoverCapture = Omit<BrowserTakeoverFrame, "controlEpoch" | "viewEpoch">
+
+export type BrowserTakeoverInput =
+  | { kind: 'click'; x: number; y: number; button?: 'left' | 'right' | 'middle' }
+  | { kind: 'wheel'; x: number; y: number; deltaX: number; deltaY: number }
+  | { kind: 'key'; phase: 'down' | 'up'; key: string; code: string; modifiers: number }
+  | { kind: 'text'; text: string }
 
 /* ------------------------------------------------------------------------------------------ */
 /* MCP tool router (WP4) and handlers (WP5, WP6, WP7, WP3)                                     */
@@ -1058,7 +1115,7 @@ export type ApiRoutes = {
   'PATCH /threads/:id/goal': { req: GoalControl; res: { goal: Goal } }
   'GET /threads/:id/runs': { req: { all?: boolean }; res: { runs: Array<Run> } }
   /** Compact sidebar messages and latest/active runs; never a transcript snapshot. */
-  'GET /workspace/activity': { req: Record<string, never>; res: { messages: Array<Message>; runs: Array<Run> } }
+  'GET /workspace/activity': { req: Record<string, never>; res: { messages: Array<Message>; runs: Array<Run>; browserRuns: Array<BrowserChannelRun> } }
   'POST /runs/:id/cancel': { req: {}; res: { run: Run } }
   'POST /runs/:id/retry': { req: {}; res: { run: Run } }
   'POST /approvals/:id': { req: { decision: 'approved' | 'denied'; standing?: boolean }; res: {} }
@@ -1104,6 +1161,27 @@ export type ApiRoutes = {
   }
   'GET /bots/:id/browser-preview': { req: { tabId?: Id }; res: { title: string; url: string; image: string } }
   'POST /browser/tabs/:id/takeover': { req: { hold: boolean }; res: {} }
+  'POST /browser/tabs/:id/takeover/session': {
+    req: {}
+    res: { sessionId: string; controlEpoch: string; viewEpoch: number }
+  }
+  'POST /browser/tabs/:id/takeover/frame': {
+    req: { sessionId: string; controlEpoch: string; viewEpoch: number }
+    res: BrowserTakeoverFrame
+  }
+  'POST /browser/tabs/:id/takeover/input': {
+    req: {
+      sessionId: string
+      controlEpoch: string
+      targetEpoch: number
+      viewEpoch: number
+      width: number
+      height: number
+      input: BrowserTakeoverInput
+    }
+    res: {}
+  }
+  'DELETE /browser/tabs/:id/takeover/session': { req: { sessionId: string; controlEpoch: string }; res: {} }
   'POST /browser/secret-entry/:id': { req: { secretName: string } | { cancel: true }; res: {} }
   'POST /computer/grants': { req: { botId: Id; threadId: Id; minutes: number }; res: { grantId: Id; expiresAt: EpochMs } }
   'POST /computer/kill': { req: {}; res: { revoked: number } }
@@ -1205,13 +1283,14 @@ export type UiEvent =
   | { type: 'process.log'; processId: Id; lines: Array<string> }
   | { type: 'preview.available'; preview: PreviewTarget }
   | { type: 'browser.tab'; tab: BrowserTabInfo & { ownerBotId: Id | null } }
+  | { type: 'browser.channel_run'; run: BrowserChannelRun }
   | { type: 'browser.secret_requested'; requestId: Id; tabId: Id; origin: string; fieldKinds: Array<'username' | 'password' | 'otp'> }
   | { type: 'desktop.control'; botId: Id; human: boolean }
   | { type: 'computer.state'; active: boolean; botId: Id | null; grantId: Id | null }
   | { type: 'import.progress'; importId: Id; phase: string; done: number; total: number }
   | { type: 'notification.created'; notification: NotificationRecord }
   | { type: 'notification.resolved'; notification: NotificationRecord }
-  | { type: 'notify'; level: 'info' | 'warning' | 'error'; title: string; body: string; threadId: Id | null; requestId?: Id | null; notificationId?: number; kind?: NotifyKind }
+  | { type: 'notify'; level: 'info' | 'warning' | 'error'; title: string; body: string; threadId: Id | null; requestId?: Id | null; notificationId?: number; kind?: NotifyKind; targetPersonId?: Id | null }
 
 /** Attention kinds need the user; message kinds (`done`, `delegation-settled`, `notice`) are informational and expire. */
 export type NotifyKind =
@@ -1264,6 +1343,8 @@ export type NotificationRecord = {
   title: string
   body: string
   requestId: string | null
+  /** When set, only this person (and no other channel member) can read the notification. */
+  targetPersonId?: Id | null
   createdAt: EpochMs
   resolvedAt: EpochMs | null
   resolution: NotifyResolution | null
@@ -1276,6 +1357,7 @@ export type NotifyInput = {
   title: string
   body: string
   requestId?: string | null
+  targetPersonId?: Id | null
 }
 
 export type RespondBehavior = 'allow' | 'deny' | 'answer'
@@ -1480,6 +1562,7 @@ export type ServiceMap = {
   'work.canAccessBrowserTab': (input: { personId: Id; role: 'member' | 'admin'; tabId: Id }) => boolean
   'work.canAccessBot': (input: { personId: Id; role: 'member' | 'admin'; botId: Id }) => boolean
   'work.ownsBot': (input: { personId: Id; botId: Id }) => boolean
+  'work.personName': (personId: Id) => string | null
   'work.accessibleBotIds': (input: { personId: Id; channelIds: Array<Id> }) => Array<Id>
   'work.canAccessAttachments': (input: { personId: Id; role: 'member' | 'admin'; attachmentIds: Array<Id> }) => boolean
   'work.canAccessRun': (input: { personId: Id; role: 'member' | 'admin'; runId: Id }) => boolean
@@ -1490,6 +1573,7 @@ export type ServiceMap = {
     threadId: Id | null
     kind: string
     requestId: Id | null
+    targetPersonId?: Id | null
   }) => boolean
   'work.personChannelIds': (personId: Id) => Array<Id>
   'work.canApprove': (input: { personId: Id; approvalId: Id }) => boolean
@@ -1507,7 +1591,7 @@ export type ServiceMap = {
   'bots.configureAccess': (input: { botId: Id; patch: Partial<Pick<Bot, 'projectId' | 'folders' | 'browserEnabled' | 'browser' | 'computerUse'>>; runId?: Id }) => Result<{ bot: Bot }, 'NOT_FOUND' | 'INVALID_ARGS' | 'MACHINE_PROJECT_CHANGE' | 'DENIED'> | Promise<Result<{ bot: Bot }, 'NOT_FOUND' | 'INVALID_ARGS' | 'MACHINE_PROJECT_CHANGE' | 'DENIED'>>
   'diagnostics.errors': () => Array<{ code: string; at: number }>
   'groups.runtime': {
-    enqueue: (args: { threadId: Id; requestMessageId: Id; trigger: RunTrigger; routineRunId?: Id }) => Result<{ run: Run }, 'THREAD_NOT_FOUND' | 'BOT_PAUSED' | 'DELEGATION_LIMIT' | 'RUNTIME_DRAINING'>
+    enqueue: (args: { threadId: Id; requestMessageId: Id; trigger: RunTrigger; routineRunId?: Id; requesterPersonId?: Id }) => Result<{ run: Run }, 'THREAD_NOT_FOUND' | 'BOT_PAUSED' | 'DELEGATION_LIMIT' | 'RUNTIME_DRAINING'>
     cancel: (id: Id) => boolean
     cancelGroupTurns: (args: { groupId: Id }) => Promise<void>
     retry: (id: Id) => Result<{ run: Run }, 'THREAD_NOT_FOUND' | 'BOT_PAUSED' | 'DELEGATION_LIMIT' | 'RUNTIME_DRAINING' | 'CONFLICT'> | null
@@ -1545,7 +1629,7 @@ export type ServiceMap = {
   'vm.shutdown': () => Promise<void>
   'vm.desktop': VmDesktop
   'store.api': StoreApi
-  'runtime.enqueue': (args: { threadId: Id; requestMessageId: Id; trigger: RunTrigger }) => Result<{ run: Run }, 'THREAD_NOT_FOUND' | 'BOT_PAUSED' | 'DELEGATION_LIMIT' | 'RUNTIME_DRAINING'>
+  'runtime.enqueue': (args: { threadId: Id; requestMessageId: Id; trigger: RunTrigger; requesterPersonId?: Id }) => Result<{ run: Run }, 'THREAD_NOT_FOUND' | 'BOT_PAUSED' | 'DELEGATION_LIMIT' | 'RUNTIME_DRAINING'>
   'runtime.isDraining': () => boolean
   'runtime.beginDrain': () => Promise<void>
   'runtime.settingsChanged': () => void
@@ -1563,6 +1647,8 @@ export type ServiceMap = {
   'runtime.cancelRun': (args: { runId: Id }) => boolean
   'runtime.shutdown': (options?: { appRestart?: boolean }) => Promise<void>
   'projects.info': (args: { projectId: Id; botId?: Id }) => Promise<ProjectInfo | null>
+  'browser.cancelRequest': (args: { runId: Id; reason?: 'timeout' }) => Id | null
+  'browser.shutdown': () => Promise<void>
   'browser.tabsForBot': (args: { botId: Id }) => Array<BrowserTabInfo>
   'browser.updateDecisionModel': (model: ApiModel | null) => void
   'computer.input': ComputerInput

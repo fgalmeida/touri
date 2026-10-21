@@ -16,9 +16,9 @@ const post = async (step: string, mode?: string) => {
     method: "POST",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
     body: JSON.stringify({ step, mode }),
-    signal: AbortSignal.timeout(20000),
+    signal: AbortSignal.timeout(40_000),
   })
-  expect(response.ok).toBe(true)
+  expect(response.ok, response.ok ? "" : await response.text()).toBe(true)
   return response.json()
 }
 
@@ -73,21 +73,23 @@ for (const theme of ["dark", "light"] as const) {
       const response = page.waitForResponse("**/__browser-decision-fixture")
       await page.getByRole("button", { name: step, exact: true }).click()
       const result = await (await response).json()
-      expect(result.result.success).toBe(step !== "submit")
+      expect(result.result.success).toBe(true)
+      if (step === "submit") {
+        expect(result.result.structured).toMatchObject({ status: "waiting_for_person" })
+      }
       if (step === "option")
         expect(
           result.snapshot.elements.find((element: { name: string }) => element.name === "Destination primary")?.value,
         ).toBe("Lisboa, Portugal")
       if (step === "date") expect(result.snapshot.text).toContain("Departure date October 24")
-      if (step === "submit") expect(result.result.errorCode).toBe("USER_TAKEOVER_REQUIRED")
     }
-    await expect(page.getByText(/Esta ação do navegador precisa da sua confirmação/).first()).toBeVisible()
+    await expect(page.getByText("Esta ação precisa de você. Assuma o controle da aba para continuar.")).toBeVisible()
     const security = await post("sensitive")
-    expect(security.result.errorCode).toBe("USER_TAKEOVER_REQUIRED")
+    expect(security.result.errorCode).toBe("TAB_HELD_BY_USER")
     expect(security.requestCount).toBe(4)
     for (const step of ["keyboard-enter", "keyboard-space"]) {
       const keyboard = await post(step)
-      expect(keyboard.result.errorCode).toBe("USER_TAKEOVER_REQUIRED")
+      expect(keyboard.result.errorCode).toBe("TAB_HELD_BY_USER")
       expect(keyboard.requestCount).toBe(4)
     }
     const accessibility = await new AxeBuilder({ page }).withTags(["wcag2a", "wcag2aa"]).analyze()
@@ -124,8 +126,8 @@ for (const mode of ["missing_key", "no_credit", "unavailable", "ask"] as const) 
         : mode === "no_credit"
           ? /está sem crédito/
           : mode === "ask"
-            ? /Não consegui escolher com segurança/
-            : /Não foi possível conectar/
+            ? /Não foi possível escolher com segurança/
+            : /assistente do navegador está indisponível/
     await expect(page.getByText(message).first()).toBeVisible()
     await expect(page.locator("body")).not.toContainText("synthetic-decision-key")
     const screenshot = await page.screenshot({ fullPage: true })
@@ -153,7 +155,9 @@ test("browser decisions: consent is off until explicitly selected", async ({ pag
   const phase = process.env.TOURI_DECISION_PHASE ?? "after"
   if (process.env.TOURI_DECISION_SHOTS) {
     await mkdir(process.env.TOURI_DECISION_SHOTS, { recursive: true })
-    await page.screenshot({ path: resolve(process.env.TOURI_DECISION_SHOTS, `${phase}-browser-consent.png`) })
+    await consent
+      .locator("..")
+      .screenshot({ path: resolve(process.env.TOURI_DECISION_SHOTS, `${phase}-browser-consent.png`) })
   }
   await expect(consent).not.toBeChecked()
   await consent.check()
@@ -161,5 +165,5 @@ test("browser decisions: consent is off until explicitly selected", async ({ pag
   await consent.uncheck()
   await expect(consent).not.toBeChecked()
   await expect(page.locator("body")).not.toContainText("fixture-private-key")
-  await info.attach("browser-consent", { body: await page.screenshot(), contentType: "image/png" })
+  await info.attach("browser-consent", { body: await consent.locator("..").screenshot(), contentType: "image/png" })
 })

@@ -4,6 +4,20 @@ import { userFacingError } from "./errors"
 export type Locale = "pt-BR" | "en"
 export const DEFAULT_LOCALE: Locale = "pt-BR"
 export const ptBR = {
+  "Your last page stays private until a new safe page is ready.":
+    "A página que você usou continua privada até uma nova página segura ficar pronta.",
+  "Waiting for the other browser request to finish.": "Aguardando o outro pedido no navegador terminar.",
+  "Stop browser work": "Parar",
+  "The page changed. Trying again.": "A página mudou. Tentando de novo.",
+  "The browser could not connect. Reconnect and try again.":
+    "Não foi possível conectar o navegador. Reconecte e tente de novo.",
+  "The browser action did not finish. Checking the page.": "A ação no navegador não terminou. Conferindo a página.",
+  "Navegador do bot": "Navegador do bot",
+  "Navegador instalado. A conexão e a página serão verificadas ao abrir o navegador.":
+    "Navegador instalado. A conexão e a página serão verificadas ao abrir o navegador.",
+  "Nenhum navegador executável foi encontrado. Instale um navegador compatível no computador do bot e verifique novamente.":
+    "Nenhum navegador executável foi encontrado. Instale um navegador compatível no computador do bot e verifique novamente.",
+
   Navegador: "Navegador",
   "Código do convite": "Código do convite",
   "Opcional. Sem e-mail, compartilhe o link ou código.": "Opcional. Sem e-mail, compartilhe o link ou código.",
@@ -653,23 +667,150 @@ export const ptBR = {
   "O portal de demonstração pediu login para continuar.": "O portal de demonstração pediu login para continuar.",
   "O portal de demonstração está pronto para continuar.": "O portal de demonstração está pronto para continuar.",
   "Retomado após a devolução do navegador": "Retomado após a devolução do navegador",
+  "Só quem fez o pedido ou a pessoa responsável pelo bot pode devolver o controle.":
+    "Só quem fez o pedido ou a pessoa responsável pelo bot pode devolver o controle.",
+  "{name} is working again": "{name} voltou a trabalhar",
   "Só quem fez o pedido ou a pessoa responsável pelo bot pode controlar esta aba.":
     "Só quem fez o pedido ou a pessoa responsável pelo bot pode controlar esta aba.",
-  "{name} is working again": "{name} voltou a trabalhar",
+  "O pedido excedeu o prazo de execução. Tente novamente.": "O pedido excedeu o prazo de execução. Tente novamente.",
   "O bot que delegou a tarefa não está disponível para a retomada.":
     "O bot que delegou a tarefa não está disponível para a retomada.",
   "Could not choose safely. Take over the tab to choose.":
     "Não foi possível escolher com segurança. Assuma o controle da aba para escolher.",
   "Browser action failed. Take over to continue.": "A ação no navegador falhou. Assuma o controle para continuar.",
   "Browser action in progress…": "Ação no navegador em andamento…",
+  "Browser steps": "Etapas do navegador",
+  "Browser progress": "Progresso do navegador",
+  "{name} · {action}": "{name} · {action}",
+  "Opening a page": "Abrindo uma página",
+  "Reading the page": "Lendo a página",
+  Clicking: "Clicando",
+  Clicked: "Clicou",
+  "Filling a field": "Preenchendo um campo",
+  "Filling a form": "Preenchendo um formulário",
+  "Selecting an option": "Selecionando uma opção",
+  "Taking a screenshot": "Tirando um print",
+  "Moving on the page": "Navegando na página",
+  "Moving between tabs": "Movendo nas abas",
+  "Moved between tabs": "Moveu nas abas",
+  "Inspecting an element": "Conferindo um elemento",
+  "Waiting for the page": "Esperando a página",
+  "See what it did": "Ver o que ele fez",
+  "Collapse browser card": "Recolher cartão do navegador",
+  "Expand browser card": "Expandir cartão do navegador",
+  "Stop browser task": "Parar tarefa no navegador",
+  "Stop {name}": "Parar {name}",
+  "You are in control · {name} paused": "Você está no controle · {name} pausado",
+  "Take over tab": "Assumir",
+  "Preparing the browser…": "Preparando o navegador…",
+  "The browser is taking longer than expected. Trying to reconnect…":
+    "O navegador está demorando mais que o esperado. Tentando reconectar…",
+  "Why {name} stopped": "Por que {name} parou",
+  "{name} paused so you can handle this step in the browser.":
+    "{name} pausou para você cuidar deste passo no navegador.",
+  "What you type here does not go to the chat or to {name}.":
+    "O que você digita aqui não vai para o chat nem para o {name}.",
+  "Preview hidden while you are in control.": "Prévia oculta enquanto você está no controle.",
+  "Show all": "Ver tudo",
+  "Show fewer": "Ver menos",
+  "in progress": "em andamento",
+  finished: "concluído",
+  Live: "Ao vivo",
   "Browser preview unavailable. Open the browser to reconnect.":
     "Prévia do navegador indisponível. Abra o navegador para reconectar.",
+  "Only the person who requested this work or the person responsible for the bot can control this browser.":
+    "Só quem pediu este trabalho ou a pessoa responsável pelo bot pode controlar este navegador.",
+  "{name} is controlling the browser. Only the requester or the person responsible for the bot can change control.":
+    "{name} está no controle do navegador. Só quem pediu ou a pessoa responsável pelo bot pode alterar o controle.",
+  "The browser queue is full. Try again shortly.": "A fila deste navegador está cheia. Tente de novo em instantes.",
+  "This browser run ended before it started.": "O turno do navegador foi cancelado antes de começar.",
+  "This browser run has already ended.": "Este turno do navegador já foi encerrado.",
+  "This browser is no longer active.": "Este navegador não está mais ativo.",
+  "The browser preview is hidden while someone is in control.":
+    "A prévia fica oculta enquanto alguém está no controle.",
+  "The browser needs your attention": "O navegador precisa de atenção",
+  "The browser needs you": "O navegador precisa de você",
+  "The site asked you to sign in. Return control to let the bot continue.":
+    "O site pediu login. Devolva o controle para o bot continuar.",
+  "The site asked you to review a purchase or payment. Return control to let the bot continue.":
+    "O site pediu uma ação de compra ou pagamento. Devolva o controle para o bot continuar.",
+  "The site asked you to submit a form. Return control to let the bot continue.":
+    "O site pediu o envio de um formulário. Devolva o controle para o bot continuar.",
+  "The site needs your confirmation to continue. Return control to let the bot continue.":
+    "O site pediu sua confirmação para continuar. Devolva o controle para o bot continuar.",
+  "The bot asked for your help in the browser. Return control to let the bot continue.":
+    "O bot pediu sua ajuda no navegador. Devolva o controle para o bot continuar.",
+
+  "The requester has not taken control. As the person responsible for the bot, you can help now.":
+    "A pessoa que pediu ainda não assumiu o navegador. Você, responsável pelo bot, pode ajudar agora.",
+  "The bot paused the browser and needs you to take control to continue.":
+    "O bot pausou o navegador e precisa que você assuma o controle para continuar.",
+  "The bot paused the browser and needs help: {reason}": "O bot pausou o navegador e precisa de ajuda: {reason}",
+  "Browser is being controlled": "O navegador está sob controle",
+  "Continue browser control": "Continuar no navegador",
+  "The browser view changed. Wait for the refreshed page.": "A página mudou. Aguarde a atualização para continuar.",
+  "The browser control connection was interrupted.": "A conexão com o controle do navegador foi interrompida.",
+  "The browser is catching up. Try again in a moment.": "O navegador está respondendo. Tente de novo em instantes.",
+  "The browser did not receive that action.": "O navegador não recebeu essa ação.",
+  "That text is too long to send to the browser.": "Esse texto é longo demais para enviar ao navegador.",
+  "Could not return control to the bot. Try again.": "Não foi possível devolver o controle ao bot. Tente novamente.",
+  "Remote browser control": "Controle remoto do navegador",
+  "You are in control · {name} is paused": "Você está no controle · {name} está pausado",
+  "This page needs your help before {name} can continue.": "Esta página precisa da sua ajuda para {name} continuar.",
+  "Finish the step here. When you hand back control, {name} can continue.":
+    "Conclua esta etapa aqui. Ao devolver o controle, {name} continua.",
+  "Latest browser actions": "Ações recentes do navegador",
+  "Latest actions": "Últimas ações",
+  Now: "agora",
+  "Connecting to the browser…": "Conectando ao navegador…",
+  "Returning control…": "Devolvendo o controle…",
+  "Live browser page": "Página atual do navegador",
+  "Browser address": "Endereço do navegador",
+  "Secure connection": "Conexão segura",
+  "Live preview": "Prévia ao vivo",
+  "Action in progress": "Em andamento",
+  "Action failed": "Falhou",
+  "Action complete": "Concluída",
+  "Show all browser steps": "Ver tudo",
+  "Show fewer browser steps": "Ver menos",
+  "Page title": "Página",
+  "Expand browser to full screen": "Expandir navegador em tela cheia",
+  "Collapse browser full screen": "Recolher navegador em tela cheia",
+  "Browser privacy": "Privacidade do navegador",
+  "What you type here stays out of chat, the bot, and history.":
+    "O que você digitar aqui não vai para o chat, o bot nem o histórico.",
+  "Type in the browser": "Digitar no navegador",
+  "Keyboard input for the browser": "Entrada de teclado para o navegador",
   "Open browser": "Abrir navegador",
   "Browser for {name}": "Navegador do {name}",
+  "Why {name} paused": "Por que {name} parou",
+  "The site asked you to sign in before continuing.": "O site pediu login para continuar.",
+  "The site asked you to review a purchase or payment before continuing.":
+    "O site pediu que você confira uma compra ou pagamento antes de continuar.",
+  "The site asked you to submit a form before continuing.":
+    "O site pediu para enviar um formulário antes de continuar.",
+  "The site needs your confirmation before continuing.": "O site pediu sua confirmação antes de continuar.",
+  "This browser is under your control now.": "Este navegador está sob seu controle.",
+  "The bot is paused until you hand control back.": "O bot está pausado até você devolver o controle.",
+  "Recent actions": "Últimas ações",
+  "What you type in the browser stays out of chat and the bot's context.":
+    "O que você digitar no navegador não vai para o chat nem para o contexto do bot.",
+  "Queued: request from {person}": "Na fila: pedido de {person}",
+  "{count} more": "mais {count}",
+  "{names} working here": "{names} trabalhando aqui",
+  "{name} in the browser": "{name} no navegador",
+  "request from {person}": "pedido de {person}",
+  "for {person}": "para {person}",
+  "Everyone in the channel sees": "Todos no canal veem",
+  "{person} is in control": "{person} está no controle",
+  "Preview hidden for the channel while {person} types": "Prévia oculta para o canal enquanto {person} digita",
+  "If the site asks for a login,": "Se o site pedir login,",
+  "{bot} pauses and calls {person}, who asked. The preview stays hidden for the channel while they type.":
+    "{bot} pausa e chama {person}, quem pediu. A prévia fica oculta para o canal enquanto a pessoa digita.",
   "{name} is working · In the browser": "{name} está trabalhando · No navegador",
   "Used the browser · 1 action": "Usou o navegador · 1 ação",
   "Used the browser · {count} actions": "Usou o navegador · {count} ações",
-  "Opened a page": "Abriu a página",
+  "Opened a page": "Abriu uma página",
   "Read the page": "Leu a página",
   "Clicked {target}": "Clicou em {target}",
   "Clicked an element": "Clicou em um elemento",
@@ -683,7 +824,7 @@ export const ptBR = {
   "Took a screenshot": "Tirou um print",
   "Scrolled the page": "Rolou a página",
   "Inspected an element": "Conferiu um elemento",
-  "Waited for the page": "Aguardou a página",
+  "Waited for the page": "Esperou a página",
   "Asked you to take over": "Pediu que você assumisse o controle",
   "Filled a saved credential": "Preencheu uma credencial salva",
   "Pressed a key": "Pressionou uma tecla",
@@ -2096,8 +2237,8 @@ export const ptBR = {
     "Navegar para um endereço, voltar, avançar ou recarregar e consultar a página atualizada.",
   "Click a target and return a fresh snapshot. The click point is hit-tested first; if another layer covers the target the call fails with TARGET_COVERED: dismiss the layer instead of clicking coordinates repeatedly.":
     "Clicar em um elemento e consultar a página. Se outra camada cobrir o alvo, remover a camada antes de tentar novamente.",
-  "Type text into a target (focuses it first) and return a fresh snapshot. Never type passwords or codes: use browser_submit_secret.":
-    "Digitar texto em um elemento. Para senhas e códigos, usar o preenchimento seguro de credenciais.",
+  "Type text into a target (focuses it first) and return a fresh snapshot. Never type passwords or codes; let the person enter them through browser_request_takeover.":
+    "Digitar texto em um elemento. Para senhas e códigos, a pessoa deve assumir o controle do navegador.",
   "Press a key or chord (e.g. Enter, Escape, Meta+A) in the focused element and return a fresh snapshot.":
     "Pressionar uma tecla ou combinação no elemento com foco.",
   "Hover a target (hit-tested) and return a fresh snapshot.":
@@ -2116,8 +2257,8 @@ export const ptBR = {
     "Avaliar uma expressão JavaScript somente de leitura. Bloqueado durante o preenchimento de credenciais.",
   "Hand the tab to the user (CAPTCHA, passkey, payment, unclear account choice, anything you cannot do safely). Blocks until the user hands it back or timeoutMs, then returns a fresh snapshot. While held, every other browser tool on the tab fails with TAB_HELD_BY_USER.":
     "Passar o controle da aba ao usuário para autenticação, confirmação ou uma ação que exija sua intervenção.",
-  "Fill credential fields without seeing the secret. If secretName refers to a stored secret allowed for this origin, it is filled; otherwise the user types it into a secure card. Never request or repeat secrets in chat. Returns a fresh snapshot (screenshots and evaluate stay blocked in the tab until it navigates).":
-    "Preencher credenciais sem mostrar o segredo ao bot, usando o cofre ou um campo seguro do aplicativo.",
+  "Do not use this tool to enter or submit credentials. Request browser takeover so the person can enter them directly; credential text never goes through chat or the model.":
+    "Não use esta ferramenta para inserir ou enviar credenciais. Peça que a pessoa assuma o controle e digite diretamente no navegador; o texto não passa pelo chat nem pelo contexto do bot.",
   "Screenshot of the main display (or a region), scaled to maxWidth. Coordinates in later computer_* calls are in THIS image's pixel space. Only available while the user has granted you control.":
     "Obter uma imagem da tela autorizada. Coordenadas posteriores usam os pixels desta imagem.",
   "Click at a point in the last screenshot's coordinate space. Returns a new screenshot.":
@@ -2505,6 +2646,7 @@ export const ptBR = {
   "held by you": "sob seu controle",
   "Hand back": "Devolver",
   "Take over": "Assumir controle",
+  "Take over browser": "Assumir",
   "No tabs for this teammate.": "Nenhuma aba para este bot.",
   "Ask the teammate to open a page with browser_open.": "Peça ao bot para abrir uma página.",
   "Keychain-backed": "armazenamento seguro",
@@ -3036,6 +3178,21 @@ export const ptBR = {
 } as const
 export type TranslationKey = keyof typeof ptBR
 const englishOverrides: Partial<Record<TranslationKey, string>> = {
+  "Your last page stays private until a new safe page is ready.":
+    "Your last page stays private until a new safe page is ready.",
+  "Waiting for the other browser request to finish.": "Waiting for the other browser request to finish.",
+  "Stop browser work": "Stop",
+  "The page changed. Trying again.": "The page changed. Trying again.",
+  "The browser could not connect. Reconnect and try again.": "The browser could not connect. Reconnect and try again.",
+  "The browser action did not finish. Checking the page.": "The browser action did not finish. Checking the page.",
+  "Navegador do bot": "Bot browser",
+  "Navegador instalado. A conexão e a página serão verificadas ao abrir o navegador.":
+    "Browser installed. The connection and page will be checked when the browser opens.",
+  "Nenhum navegador executável foi encontrado. Instale um navegador compatível no computador do bot e verifique novamente.":
+    "No executable browser was found. Install a compatible browser on the bot's computer and check again.",
+
+  "Take over tab": "Take over",
+  "Take over browser": "Take over",
   "See what the bot did": "See what the bot did",
   "Check your tools": "Check your tools",
   "See what is ready to use and what needs your attention.": "See what is ready to use and what needs your attention.",
@@ -3051,6 +3208,34 @@ const englishOverrides: Partial<Record<TranslationKey, string>> = {
   "touri can find your installed tools": "touri can find your installed tools",
   "touri needs help finding your tools": "touri needs help finding your tools",
   "Check your shell startup settings, then reopen touri.": "Check your shell startup settings, then reopen touri.",
+  "Queued: request from {person}": "Queued: request from {person}",
+  "{count} more": "{count} more",
+  "{names} working here": "{names} working here",
+  "{name} in the browser": "{name} in the browser",
+  "request from {person}": "request from {person}",
+  "for {person}": "for {person}",
+  "Everyone in the channel sees": "Everyone in the channel sees",
+  "{person} is in control": "{person} is in control",
+  "Preview hidden for the channel while {person} types": "Preview hidden for the channel while {person} types",
+  "If the site asks for a login,": "If the site asks for a login,",
+  "{bot} pauses and calls {person}, who asked. The preview stays hidden for the channel while they type.":
+    "{bot} pauses and calls {person}, who asked. The preview stays hidden for the channel while they type.",
+  "{name} is working · In the browser": "{name} is working · In the browser",
+  "Browser address": "Browser address",
+  "Secure connection": "Secure connection",
+  "Live preview": "Live preview",
+  "Action in progress": "In progress",
+  "Action failed": "Failed",
+  "Action complete": "Complete",
+  "Show all browser steps": "See all",
+  "Show fewer browser steps": "Show fewer",
+  "Page title": "Page",
+  "Expand browser to full screen": "Expand browser to full screen",
+  "Collapse browser full screen": "Collapse full-screen browser",
+  "Browser privacy": "Browser privacy",
+  "What you type here stays out of chat, the bot, and history.":
+    "What you type here stays out of chat, the bot, and history.",
+  "Hand back to {name}": "Hand back to {name}",
   Conversations: "Conversations",
   "Thread actions for {title}": "Actions for {title}",
   "Thread actions": "Conversation actions",
@@ -4396,9 +4581,12 @@ const englishOverrides: Partial<Record<TranslationKey, string>> = {
   "Retomado após a devolução do navegador": "Resumed after the browser hand-back",
   "O portal de demonstração pediu login para continuar.": "The demo portal asked you to sign in before continuing.",
   "O portal de demonstração está pronto para continuar.": "The demo portal is ready to continue.",
+  "Só quem fez o pedido ou a pessoa responsável pelo bot pode devolver o controle.":
+    "Only the requester or the bot owner can return control.",
+  "{name} is working again": "{name} is working again",
   "Só quem fez o pedido ou a pessoa responsável pelo bot pode controlar esta aba.":
     "Only the requester or the bot owner can control this tab.",
-  "{name} is working again": "{name} is working again",
+  "O pedido excedeu o prazo de execução. Tente novamente.": "The request exceeded its time limit. Try again.",
   "O bot que delegou a tarefa não está disponível para a retomada.":
     "The bot that delegated the task is unavailable to resume it.",
   "Baixar imagem": "Download image",

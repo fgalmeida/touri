@@ -1,6 +1,17 @@
 /* Alternate input and system palettes share the same controls and readable status copy. */
 @media (pointer: coarse) {
-  :is(.bot-sidebar, .chat-toolbar, .bot-panel, .bot-panel-tabs, .bot-context-menu, .tool-card, .composer) button,
+  :is(
+      .bot-sidebar,
+      .chat-toolbar,
+      .bot-panel,
+      .bot-panel-tabs,
+      .bot-context-menu,
+      .tool-card,
+      .browser-activity-card,
+      .composer,
+      .composer-browser-status
+    )
+    button,
   .activity-mark .activity-approval-link {
     min-width: var(--touch-target-size) !important;
     min-height: var(--touch-target-size) !important;

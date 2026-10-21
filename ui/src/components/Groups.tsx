@@ -2,6 +2,7 @@ import type { AvatarShape, Bot, BotGroup, GroupInput, Message, Run, Thread } fro
 import { avatarColorFor, avatarProfileFor } from "@touri/contracts/avatar"
 import { useEffect, useMemo, useRef, useState } from "react"
 import { userFacingError } from "../errors"
+import { ChannelHeaderChip, ChannelWorkingMarker } from "../features/channelBrowser/ChannelBrowser"
 import { type Locale, t } from "../i18n"
 import { AvatarPicker } from "./AvatarPicker"
 import { BotAvatar } from "./BotAvatar"
@@ -39,6 +40,7 @@ export const GroupSidebar = ({
   onEdit,
   onNewThread,
   onDelete,
+  channelWorking,
   locale = "pt-BR",
 }: {
   groups: BotGroup[]
@@ -50,6 +52,8 @@ export const GroupSidebar = ({
   onEdit: (group: BotGroup) => void
   onNewThread: (group: BotGroup) => void
   onDelete?: ((groupId: string) => Promise<void>) | undefined
+  // Group id -> names of the bots working in the browser for that channel.
+  channelWorking?: Record<string, string[]> | undefined
   locale?: Locale
 }) => (
   <section className="group-sidebar" aria-label={t("Bot groups", {}, locale)}>
@@ -79,6 +83,7 @@ export const GroupSidebar = ({
             onEdit={() => onEdit(group)}
             onNewThread={() => onNewThread(group)}
             onDelete={onDelete}
+            workingBots={channelWorking?.[group.id] ?? []}
             locale={locale}
           />
         ))}
@@ -96,6 +101,7 @@ const GroupSidebarEntry = ({
   onEdit,
   onNewThread,
   onDelete,
+  workingBots,
   locale,
 }: {
   group: BotGroup
@@ -106,6 +112,7 @@ const GroupSidebarEntry = ({
   onEdit: () => void
   onNewThread: () => void
   onDelete?: ((groupId: string) => Promise<void>) | undefined
+  workingBots: string[]
   locale: Locale
 }) => {
   const [menuOpen, setMenuOpen] = useState(false)
@@ -137,6 +144,7 @@ const GroupSidebarEntry = ({
             locale={locale}
           />
           <span>{group.name}</span>
+          <ChannelWorkingMarker names={workingBots} locale={locale} />
         </button>
         <SidebarActionsMenu
           label={t("Ações do grupo {name}", { name: group.name }, locale)}
@@ -333,6 +341,7 @@ export const GroupHeader = ({
         <span className="group-member-count">{t("Group member count", { count: bots.length }, locale)}</span>
       </div>
     </div>
+    <ChannelHeaderChip locale={locale} />
     <div className="group-header-members">
       <MemberMascots bots={bots} locale={locale} />
       <span>

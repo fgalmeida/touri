@@ -1,6 +1,7 @@
 import type { Database } from "bun:sqlite"
 import type { BrowserTabInfo, Id, Kernel } from "@touri/contracts"
 import type { SavedSecret } from "../approvals/secrets"
+import { sanitizeHumanTakeoverUrl } from "./takeover-privacy"
 import type { BrowserTabRow, TabState } from "./types"
 
 type SecretRow = {
@@ -20,27 +21,32 @@ const toInfo = (row: BrowserTabRow): TabState["info"] => ({
   state: row.state,
   openerTabId: row.opener_tab_id,
   heldByUser: row.held_by_user === 1,
+  takeoverReason: row.takeover_reason,
   lastUsedAt: row.last_used_at,
   ownerBotId: row.owner_bot_id,
   ownerThreadId: row.owner_thread_id,
 })
 
-const toRow = (info: TabState["info"], targetId: string | null, createdAt: number): BrowserTabRow => ({
-  id: info.tabId,
+const toRow = (tab: TabState, createdAt: number): BrowserTabRow => ({
+  id: tab.info.tabId,
   profile: "default",
-  owner_bot_id: info.ownerBotId,
-  owner_thread_id: info.ownerThreadId,
-  opener_tab_id: info.openerTabId,
-  cdp_target_id: targetId,
-  url: info.url,
-  title: info.title,
-  state: info.state,
-  held_by_user: info.heldByUser ? 1 : 0,
+  owner_bot_id: tab.info.ownerBotId,
+  owner_thread_id: tab.info.ownerThreadId,
+  opener_tab_id: tab.info.openerTabId,
+  cdp_target_id: tab.targetId,
+  url: tab.privateAfterTakeover ? sanitizeHumanTakeoverUrl(tab.info.url) : tab.info.url,
+  title: tab.privateAfterTakeover ? "" : tab.info.title,
+  state: tab.info.state,
+  held_by_user: tab.info.heldByUser ? 1 : 0,
+  private_after_takeover: tab.privateAfterTakeover ? 1 : 0,
+  takeover_reason: tab.takeoverReason,
+  private_input: tab.privateInput ? 1 : 0,
   created_at: createdAt,
-  last_used_at: info.lastUsedAt,
+  last_used_at: tab.info.lastUsedAt,
 })
 
 export type BrowserStore = {
+  dispose: () => void
   load: () => Array<TabState>
   create: (args: { botId: Id; threadId: Id; url: string; openerTabId: Id | null; targetId: string | null }) => TabState
   save: (tab: TabState) => void
@@ -62,8 +68,17 @@ export const createBrowserStore = ({
 }): BrowserStore => {
   const database = kernel.db as Database
   const tabs = new Map<Id, TabState>()
+  let disposed = false
 
   const load = (): Array<TabState> => {
+    // Older releases saved holds without a deadline; release them without exposing the private page or resuming work.
+    database
+      .query(`UPDATE browser_tabs
+        SET held_by_user = 0, takeover_reason = NULL, private_after_takeover = 1, private_input = 1
+        WHERE profile = ? AND held_by_user = 1 AND NOT EXISTS (
+          SELECT 1 FROM browser_pending_handoffs handoff WHERE handoff.tab_id = browser_tabs.id AND handoff.state = 'waiting'
+        )`)
+      .run(profile)
     database
       .query(
         `UPDATE browser_tabs SET state = 'unloaded'${retainTargets ? "" : ", cdp_target_id = NULL"} WHERE state = 'live' AND profile = ?`,
@@ -86,6 +101,9 @@ export const createBrowserStore = ({
         diagnostics: [],
         navigationVersion: 0,
         secretMode: false,
+        privateAfterTakeover: row.private_after_takeover === 1,
+        takeoverReason: row.takeover_reason,
+        privateInput: row.private_input === 1,
         dialog: null,
         lastFailureKey: null,
         failureCount: 0,
@@ -123,6 +141,7 @@ export const createBrowserStore = ({
       state: targetId === null ? "unloaded" : "live",
       openerTabId,
       heldByUser: false,
+      takeoverReason: null,
       lastUsedAt: now,
       ownerBotId: botId,
       ownerThreadId: getExistingThreadId(database, threadId),
@@ -138,6 +157,9 @@ export const createBrowserStore = ({
       diagnostics: [],
       navigationVersion: 0,
       secretMode: false,
+      privateAfterTakeover: false,
+      takeoverReason: null,
+      privateInput: false,
       dialog: null,
       lastFailureKey: null,
       failureCount: 0,
@@ -149,7 +171,7 @@ export const createBrowserStore = ({
     }
     database
       .query(
-        "INSERT INTO browser_tabs (id, profile, owner_bot_id, owner_thread_id, opener_tab_id, cdp_target_id, url, title, state, held_by_user, created_at, last_used_at) VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, 0, ?, ?)",
+        "INSERT INTO browser_tabs (id, profile, owner_bot_id, owner_thread_id, opener_tab_id, cdp_target_id, url, title, state, held_by_user, private_input, created_at, last_used_at) VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, 0, 0, ?, ?)",
       )
       .run(tabId, profile, botId, info.ownerThreadId, openerTabId, targetId, url, info.state, now, now)
     tabs.set(tabId, tab)
@@ -157,13 +179,17 @@ export const createBrowserStore = ({
   }
 
   const save = (tab: TabState): void => {
-    // Channel deletion clears the persisted owner but cannot refresh a live tab's cached reference.
-    const info = { ...tab.info, ownerThreadId: getExistingThreadId(database, tab.info.ownerThreadId) }
-    const row = toRow(info, tab.targetId, Date.now())
-    tab.info = { ...info, lastUsedAt: row.last_used_at }
+    if (disposed) return
+    // A deleted conversation can leave a stale owner in a live browser tab.
+    const thread = tab.info.ownerThreadId
+      ? database.query<{ id: Id }, [Id]>("SELECT id FROM threads WHERE id = ?").get(tab.info.ownerThreadId)
+      : null
+    tab.info = { ...tab.info, ownerThreadId: thread?.id ?? null }
+    const row = toRow(tab, Date.now())
+    tab.info.lastUsedAt = row.last_used_at
     database
       .query(
-        "UPDATE browser_tabs SET owner_bot_id = ?, owner_thread_id = ?, opener_tab_id = ?, cdp_target_id = ?, url = ?, title = ?, state = ?, held_by_user = ?, last_used_at = ? WHERE id = ?",
+        "UPDATE browser_tabs SET owner_bot_id = ?, owner_thread_id = ?, opener_tab_id = ?, cdp_target_id = ?, url = ?, title = ?, state = ?, held_by_user = ?, private_after_takeover = ?, takeover_reason = ?, private_input = ?, last_used_at = ? WHERE id = ?",
       )
       .run(
         row.owner_bot_id,
@@ -174,6 +200,9 @@ export const createBrowserStore = ({
         row.title,
         row.state,
         row.held_by_user,
+        row.private_after_takeover,
+        row.takeover_reason,
+        row.private_input,
         row.last_used_at,
         row.id,
       )
@@ -218,7 +247,19 @@ export const createBrowserStore = ({
   }
 
   const secretAccount: BrowserStore["secretAccount"] = (args) => secretReference(args)?.account ?? null
-  return { load, create, save, update, find, list, secretAccount, secretReference }
+  return {
+    load,
+    create,
+    save,
+    update,
+    find,
+    list,
+    secretAccount,
+    secretReference,
+    dispose: () => {
+      disposed = true
+    },
+  }
 }
 
 export const publicTabInfo = ({ tab }: { tab: TabState }): BrowserTabInfo & { ownerBotId: Id | null } => ({
@@ -228,6 +269,7 @@ export const publicTabInfo = ({ tab }: { tab: TabState }): BrowserTabInfo & { ow
   state: tab.info.state,
   openerTabId: tab.info.openerTabId,
   heldByUser: tab.info.heldByUser,
+  takeoverReason: tab.takeoverReason,
   takeoverRequested: tab.takeover !== null,
   takeoverRunId: tab.takeover?.runId ?? null,
   lastUsedAt: tab.info.lastUsedAt,

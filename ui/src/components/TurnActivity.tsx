@@ -1,43 +1,85 @@
-import type { Message, Run } from "@touri/contracts"
-import type { AvatarIdentity } from "@touri/contracts/avatar"
-import { useEffect, useId, useState } from "react"
+import type { Bot, Message, Run } from "@touri/contracts"
+import { lazy, type ReactNode, Suspense, useContext, useEffect, useId, useState } from "react"
 import type { UiApi } from "../api/client"
+import { InlinePreviewContext } from "../features/desktop/InlineLivePreview"
 import { type Locale, t } from "../i18n"
 import { ActivityMark } from "./ActivityMark"
-import { BrowserActivityCard } from "./BrowserActivityCard"
 import { getBrowserActivityTools } from "./browserActivityPresentation"
-import type { BrowserContinuationActivity } from "./browserContinuationActivity"
 import { MarkdownContent } from "./MarkdownContent"
 import type { MascotState } from "./mascotState"
 import { ToolCallCard } from "./ToolCallCard"
 import { activityGroupLabels, activityGroups, activitySummary, activityTools, approvalTools } from "./turnActivityModel"
 import "./turn-activity.css"
 
+const BrowserActivityCard = lazy(() =>
+  import("./BrowserActivityCard").then((module) => ({ default: module.BrowserActivityCard })),
+)
+
+/** The single browser card of a turn, with the bot's own preview context. */
+export const BrowserTurnCard = ({
+  message,
+  run,
+  bot,
+  locale = "pt-BR",
+  children,
+}: {
+  message: Message
+  run?: Run | undefined
+  bot?: Bot | undefined
+  locale?: Locale
+  children?: ReactNode
+}) => {
+  const inlinePreview = useContext(InlinePreviewContext)
+  const value = inlinePreview && {
+    ...inlinePreview,
+    bot: bot ?? inlinePreview.bot,
+    machine: bot && inlinePreview.bot?.id !== bot.id ? undefined : inlinePreview.machine,
+  }
+  const card = (
+    <Suspense fallback={<div className="browser-card-loading" aria-busy="true" />}>
+      <BrowserActivityCard
+        parts={message.parts}
+        finished={message.status !== "streaming"}
+        createdAt={message.createdAt}
+        threadId={message.threadId}
+        runId={message.runId}
+        waitingForPerson={run?.browserWaitingForPerson}
+        botName={message.sender?.name ?? bot?.name ?? inlinePreview?.bot?.name ?? "touri"}
+        locale={locale}
+      >
+        {children}
+      </BrowserActivityCard>
+    </Suspense>
+  )
+
+  return value ? <InlinePreviewContext.Provider value={value}>{card}</InlinePreviewContext.Provider> : card
+}
+
 export const TurnActivity = ({
   message,
   run,
-  browserActivity,
-  hideBrowserActivity = false,
-  botName,
   api,
   bot,
   state,
   preparingEnvironment,
   onCancel,
   onFocusApproval,
+  browserFlow,
+  hideBrowserCard = false,
   locale = "pt-BR",
 }: {
   message: Message
   run?: Run | undefined
-  browserActivity?: BrowserContinuationActivity | undefined
-  hideBrowserActivity?: boolean | undefined
-  botName?: string
   api?: UiApi | undefined
-  bot?: AvatarIdentity | undefined
+  bot?: Bot | undefined
   state: MascotState
   preparingEnvironment?: boolean | undefined
   onCancel?: ((runId: string) => Promise<void>) | undefined
   onFocusApproval?: ((approvalId: string) => void) | undefined
+  /** Narration and step rows folded into the finished browser card. */
+  browserFlow?: ReactNode
+  /** The live card is rendered after the last step by the message instead. */
+  hideBrowserCard?: boolean
   locale?: Locale
 }) => {
   const id = useId()
@@ -52,20 +94,16 @@ export const TurnActivity = ({
   const approvals = new Set([...approvalTools(message.parts).values()].map((part) => part.callId))
   const groups = activityGroups(tools.filter((part) => !approvals.has(part.callId) && !browserCallIds.has(part.callId)))
   const reasoning = message.parts.flatMap((part) => (part.type === "reasoning" && part.text.trim() ? [part.text] : []))
+  const browserOnly = browserTools.length > 0 && groups.length === 0 && approvals.size === 0 && reasoning.length === 0
+  const browserCard = browserTools.length > 0 && !hideBrowserCard && (
+    <BrowserTurnCard message={message} run={run} bot={bot} locale={locale}>
+      {browserFlow}
+    </BrowserTurnCard>
+  )
   return (
     <div className="turn-activity" data-running={live}>
-      {browserTools.length > 0 && !hideBrowserActivity && (
-        <BrowserActivityCard
-          parts={browserActivity?.parts ?? message.parts}
-          finished={browserActivity?.finished ?? !live}
-          createdAt={message.createdAt}
-          threadId={message.threadId}
-          runId={browserActivity?.runId ?? message.runId ?? run?.id ?? null}
-          botName={botName ?? message.sender?.name ?? "touri"}
-          locale={locale}
-        />
-      )}
-      {live ? (
+      {browserCard}
+      {browserOnly ? null : live ? (
         <ActivityMark
           state={state}
           run={run}
@@ -82,7 +120,7 @@ export const TurnActivity = ({
           onExpandReasoning={() => setExpanded((value) => !value)}
           onFocusApproval={onFocusApproval}
         />
-      ) : (
+      ) : !live ? (
         <button
           className="turn-activity-toggle"
           type="button"
@@ -103,7 +141,7 @@ export const TurnActivity = ({
           </svg>
           {activitySummary(message, run, locale)}
         </button>
-      )}
+      ) : null}
       <div id={id} hidden={!expanded} className="turn-activity-details">
         {expanded && (
           <>
