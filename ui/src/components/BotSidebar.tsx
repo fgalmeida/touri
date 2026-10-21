@@ -55,6 +55,7 @@ type SidebarProps = {
   host?: HostKind
   onNavigate?: () => void
   groups?: BotGroup[]
+  onInvitePerson?: (() => void) | undefined
   onNewGroup?: () => void
   onEditGroup?: (group: BotGroup) => void
   onDeleteGroup?: (groupId: string) => Promise<void>
@@ -335,6 +336,15 @@ export const Sidebar = (props: SidebarProps) => {
           })}
         </div>
       </div>
+      {props.onInvitePerson && (
+        <button
+          type="button"
+          className="button button-quiet sidebar-invite"
+          onClick={() => navigate(() => props.onInvitePerson?.())}
+        >
+          {t("Convidar pessoa")}
+        </button>
+      )}
       {props.onNewGroup && (
         <GroupSidebar
           groups={props.groups ?? []}
