@@ -146,6 +146,14 @@ export const Sidebar = (props: SidebarProps) => {
     props.onNavigate?.()
     action()
   }
+  const openNotification = (item: NotificationRecord): void => {
+    if (props.onNeedsYou && !isFailureNotice(item)) {
+      props.onNeedsYou(item)
+      return
+    }
+
+    navigate(() => props.notificationActions.open(item))
+  }
   // Switching bots inside Preview keeps that view; global pages return to the bot conversation.
   const select = (id: Id): void => {
     props.onNavigate?.()
@@ -181,6 +189,14 @@ export const Sidebar = (props: SidebarProps) => {
         ) : (
           <span className="traffic-light-spacer" aria-hidden="true" />
         )}
+        <button
+          type="button"
+          className="sidebar-bots-link"
+          aria-current={props.section === "bots" ? "page" : undefined}
+          onClick={() => navigate(props.onChat)}
+        >
+          {t("Bots")} <span>{props.bots.length}</span>
+        </button>
         <div className="sidebar-top-actions">
           <button
             type="button"
@@ -214,23 +230,15 @@ export const Sidebar = (props: SidebarProps) => {
               onClick={props.onNavigate}
               aria-label={t("Close menu")}
             >
-              ×
+              <SidebarIcon>
+                <path d="m6 6 12 12M18 6 6 18" />
+              </SidebarIcon>
             </button>
           )}
         </div>
       </div>
-      <div className="sidebar-list-heading">
-        <button
-          type="button"
-          className="sidebar-bots-link"
-          aria-current={props.section === "bots" ? "page" : undefined}
-          onClick={() => navigate(props.onChat)}
-        >
-          {t("Bots")} <span>{props.bots.length}</span>
-        </button>
-      </div>
       <NotificationAttentionBar
-        notifications={needsYou}
+        notifications={needsYou.filter((item) => !props.bots.some((bot) => bot.id === item.botId))}
         onSelect={(item) => {
           const select = props.onNeedsYou ?? props.notificationActions.open
           if (item.kind === "approval" && item.threadId && item.requestId) props.onNavigate?.()
@@ -249,7 +257,10 @@ export const Sidebar = (props: SidebarProps) => {
           </span>{" "}
           <span>{t("Work queued count", { count: queuedWorkCount })}</span>{" "}
           <span className="sidebar-work-action">
-            {t("View work")} <span aria-hidden="true">›</span>
+            {t("View work")}{" "}
+            <SidebarIcon>
+              <path d="m9 18 6-6-6-6" />
+            </SidebarIcon>
           </span>
         </button>
       )}
@@ -309,7 +320,7 @@ export const Sidebar = (props: SidebarProps) => {
                     navigate(() => openRoutineHistory(bot.id, routineId ?? selectedRoutineId))
                   }
                   onReviewApproval={(target) => navigate(() => props.onReviewApproval(target))}
-                  onNotification={(item) => navigate(() => props.notificationActions.open(item))}
+                  onNotification={openNotification}
                   onDelete={props.onDeleteBot}
                   onArchiveThread={props.onArchiveThread}
                   onArchiveThreads={props.onArchiveThreads}
@@ -813,7 +824,7 @@ const BotEntry = ({
                 if (target) onReviewApproval(target)
               }}
             >
-              {approvals.length}
+              <span>{approvals.length}</span>
             </button>
           ) : (waiting || failure)?.threadId ? (
             <button
@@ -830,7 +841,7 @@ const BotEntry = ({
             >
               <span className="sidebar-status-dot" />
             </button>
-          ) : badgeState ? (
+          ) : badgeState && badgeState !== "running" ? (
             <span
               className={`sidebar-status-dot state-${badgeState}`}
               role="img"
@@ -1010,6 +1021,10 @@ const BotEntry = ({
           )}
           {visibleRoutineIds.length > 0 && (
             <button type="button" className="new-thread-row" onClick={() => onRoutineHistory(historyRoutineId)}>
+              <SidebarIcon>
+                <circle cx="12" cy="12" r="8" />
+                <path d="M12 7v5l3 2" />
+              </SidebarIcon>
               {t("Routine run history")}
             </button>
           )}

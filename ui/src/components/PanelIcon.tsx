@@ -11,6 +11,13 @@ type Name =
   | "computer"
   | "archive"
   | "trash"
+  | "panel"
+  | "plus"
+  | "warning"
+  | "chevron-down"
+  | "chevron-left"
+  | "chevron-right"
+  | "arrow-right"
 
 const paths: Record<Name, string> = {
   close: "m6 6 12 12M18 6 6 18",
@@ -25,6 +32,13 @@ const paths: Record<Name, string> = {
   computer: "M3 4h18v13H3V4Zm9 13v4m-5 0h10",
   archive: "M3 4h18v4H3V4Zm2 4v12h14V8m-9 3h4",
   trash: "M3 6h18M9 6V3h6v3M5 6l1 15h12l1-15M10 10v7M14 10v7",
+  panel: "M4 4h16v16H4zM12 4v16",
+  plus: "M12 5v14M5 12h14",
+  warning: "M12 3 2.5 20h19L12 3Zm0 6v5m0 3v.01",
+  "chevron-down": "m6 9 6 6 6-6",
+  "chevron-left": "m15 18-6-6 6-6",
+  "chevron-right": "m9 18 6-6-6-6",
+  "arrow-right": "M5 12h14m-7-7 7 7-7 7",
 }
 
 export const PanelIcon = ({ name }: { name: Name }) => (
@@ -33,7 +47,7 @@ export const PanelIcon = ({ name }: { name: Name }) => (
     viewBox="0 0 24 24"
     fill="none"
     stroke="currentColor"
-    strokeWidth="1.6"
+    strokeWidth="2"
     strokeLinecap="round"
     strokeLinejoin="round"
     aria-hidden="true"

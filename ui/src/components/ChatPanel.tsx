@@ -74,6 +74,7 @@ import { MarkdownContent } from "./MarkdownContent"
 import { MessageAttachments } from "./MessageAttachments"
 import { useInsertedIds } from "./Motion"
 import { mascotSignalFor } from "./mascotState"
+import { PanelIcon } from "./PanelIcon"
 import { ToolCallList } from "./ToolCallList"
 import { ToolText } from "./ToolOutput"
 import { TurnActivity } from "./TurnActivity"
@@ -938,7 +939,7 @@ const MessageBubble = ({
             ) : (
               <span role="img" aria-label={t("Membro excluído: {name}", { name: message.sender.name })}>
                 <BotAvatar
-                  bot={{ id: message.sender.id, color: "#6b7280", avatarShape: "none-none" }}
+                  bot={{ id: message.sender.id, color: null, avatarShape: "none-none" }}
                   size={22}
                   state="idle"
                   still
@@ -1064,7 +1065,7 @@ const MessageBubble = ({
             disabled={branchIndex === siblings.length - 1}
             aria-label={t("Next branch")}
           >
-            ›
+            <PanelIcon name="chevron-right" />
           </button>
         </fieldset>
       )}
@@ -1187,7 +1188,7 @@ export const ChatPanel = ({
         <header className="chat-header" data-tauri-drag-region="deep">
           <span className="chat-header-crumb">{t("Bots")}</span>
           <div className="chat-bot-chip">
-            {bot && <BotAvatar bot={bot} size={18} />}
+            {bot && <BotAvatar bot={bot} size={20} />}
             <h1 className="chat-page-heading">{bot?.name ?? "touri"}</h1>
             {bot?.anyFolderAccess && (
               <span className="any-folder-badge">{t("Any folder on this {host}", { host: getHostLabel(host) })}</span>
@@ -1204,7 +1205,7 @@ export const ChatPanel = ({
                 aria-controls="bot-panel"
                 onClick={onTogglePanel}
               >
-                ◧
+                <PanelIcon name="panel" />
               </button>
             )}
           </div>
@@ -1318,7 +1319,7 @@ export const ChatPanel = ({
                 aria-controls="bot-panel"
                 onClick={onTogglePanel}
               >
-                ◧
+                <PanelIcon name="panel" />
               </button>
             )}
           </div>
