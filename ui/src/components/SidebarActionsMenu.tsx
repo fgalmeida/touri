@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef } from "react"
+import { type ReactNode, useEffect, useId, useRef } from "react"
 import { createPortal } from "react-dom"
 import { useAnchoredPopover } from "./useAnchoredPopover"
 
@@ -6,6 +6,7 @@ type SidebarAction = {
   label: string
   onSelect: () => void
   destructive?: boolean
+  disabled?: boolean
 }
 
 export const SidebarActionsMenu = ({
@@ -13,11 +14,15 @@ export const SidebarActionsMenu = ({
   open,
   onOpenChange: setOpen,
   actions,
+  triggerClassName = "bot-settings",
+  trigger: triggerContent = "···",
 }: {
   label: string
   open: boolean
   onOpenChange: (open: boolean) => void
   actions: SidebarAction[]
+  triggerClassName?: string
+  trigger?: ReactNode
 }) => {
   const container = useRef<HTMLDivElement>(null)
   const trigger = useRef<HTMLButtonElement>(null)
@@ -25,7 +30,7 @@ export const SidebarActionsMenu = ({
   const menuId = useId()
   useEffect(() => {
     if (!open) return
-    menu.current?.querySelector<HTMLButtonElement>("button")?.focus()
+    menu.current?.querySelector<HTMLButtonElement>("button:not(:disabled)")?.focus()
     const close = (event: MouseEvent) => {
       if (
         event.target instanceof Node &&
@@ -59,7 +64,7 @@ export const SidebarActionsMenu = ({
     >
       <button
         type="button"
-        className="bot-settings"
+        className={triggerClassName}
         ref={trigger}
         aria-label={label}
         aria-haspopup="menu"
@@ -73,13 +78,19 @@ export const SidebarActionsMenu = ({
           setOpen(!open)
         }}
         onKeyDown={(event) => {
+          if (event.key === "Escape" && open) {
+            event.preventDefault()
+            event.stopPropagation()
+            setOpen(false)
+            return
+          }
           if (event.key === "ArrowDown") {
             event.preventDefault()
             setOpen(true)
           }
         }}
       >
-        ···
+        {triggerContent}
       </button>
       {open &&
         createPortal(
@@ -103,7 +114,9 @@ export const SidebarActionsMenu = ({
                 trigger.current?.focus()
                 setOpen(false)
               }
-              const buttons = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>("button"))
+              const buttons = Array.from(
+                event.currentTarget.querySelectorAll<HTMLButtonElement>("button:not(:disabled)"),
+              )
               const index =
                 document.activeElement instanceof HTMLButtonElement ? buttons.indexOf(document.activeElement) : -1
               const next = getNextActionIndex(event.key, index, buttons.length)
@@ -119,6 +132,7 @@ export const SidebarActionsMenu = ({
                 type="button"
                 role="menuitem"
                 className={action.destructive ? "tool-action-deny" : undefined}
+                disabled={action.disabled}
                 onClick={() => launch(action.onSelect)}
               >
                 {action.label}

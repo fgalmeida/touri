@@ -44,3 +44,18 @@ export const showBotAdvanced = async (page: Page, name = "mark"): Promise<void> 
   await openBotActions(page, name)
   await page.getByRole("menuitem", { name: "Avançado", exact: true }).click()
 }
+
+export const chooseBotAction = async (page: Page, action: string, name = "mark"): Promise<void> => {
+  await openBotActions(page, name)
+  await page.getByRole("menuitem", { name: action, exact: true }).click()
+}
+
+export const openConversations = showBotConversations
+
+export const chooseChannelAction = async (page: Page, channel: string, action: string): Promise<void> => {
+  await page
+    .locator(".group-header")
+    .getByRole("button", { name: `Ações do canal ${channel}`, exact: true })
+    .click()
+  await page.getByRole("menuitem", { name: action, exact: true }).click()
+}

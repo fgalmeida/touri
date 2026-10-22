@@ -34,6 +34,8 @@ import { paletteShortcutLabel } from "../features/commandPalette/shortcut"
 import { getRoutineRunDateLabel, getRoutineRunSidebarDateLabel, t } from "../i18n"
 import { isRoutineConversation } from "../routineConversation"
 import {
+  getLastActivityAt,
+  getSidebarRowTime,
   isFailureNotice,
   isInformationalNotice,
   pendingNotifications,
@@ -170,6 +172,20 @@ const SidebarIcon = ({ children }: { children: ReactNode }) => (
   </svg>
 )
 
+/** One bot row: name and last-activity time on top, one gray line with the latest message or state below. */
+const BotRowLabel = ({ bot, preview, time }: { bot: Bot; preview: string; time: string }) => (
+  <span className="bot-row-text">
+    <span className="bot-row-top">
+      <strong title={bot.roleLine || bot.title || undefined}>{bot.name}</strong>
+      <small className="bot-role visually-hidden">{bot.roleLine || bot.title || t("Bot local")}</small>
+      {time && <small className="bot-row-time">{time}</small>}
+    </span>
+    <small className={bot.paused ? "bot-preview paused" : "bot-preview"} title={preview}>
+      {preview}
+    </small>
+  </span>
+)
+
 export const Sidebar = (props: SidebarProps) => {
   const [savedSidebarMode] = useState(getSavedSidebarMode)
   const [sidebarMode, setSidebarMode] = useState<SidebarMode>(
@@ -304,6 +320,9 @@ export const Sidebar = (props: SidebarProps) => {
     },
     [navigate],
   )
+  const invitePerson = useCallback((): void => {
+    navigate(() => propsRef.current.onInvitePerson?.())
+  }, [navigate])
   const deleteBot = useCallback((botId: string, name: string, deleteVolumes: boolean): Promise<void> => {
     return propsRef.current.onDeleteBot?.(botId, name, deleteVolumes) ?? Promise.resolve()
   }, [])
@@ -504,19 +523,21 @@ export const Sidebar = (props: SidebarProps) => {
           <span className="traffic-light-spacer" aria-hidden="true" />
         )}
         <div className="sidebar-top-actions">
-          <button
-            type="button"
-            className="sidebar-icon-button"
-            onClick={() => navigate(props.onSearch)}
-            aria-label={t("Search conversations")}
-            aria-keyshortcuts="Meta+K Control+K"
-            title={`${t("Search bots, conversations and settings")} (${paletteShortcutLabel()})`}
-          >
-            <SidebarIcon>
-              <circle cx="10.5" cy="10.5" r="6.5" />
-              <path d="m16 16 4 4" />
-            </SidebarIcon>
-          </button>
+          {sidebarMode === "bots" && (
+            <button
+              type="button"
+              className="sidebar-icon-button"
+              onClick={() => navigate(props.onSearch)}
+              aria-label={t("Search conversations")}
+              aria-keyshortcuts="Meta+K Control+K"
+              title={`${t("Search bots, conversations and settings")} (${paletteShortcutLabel()})`}
+            >
+              <SidebarIcon>
+                <circle cx="10.5" cy="10.5" r="6.5" />
+                <path d="m16 16 4 4" />
+              </SidebarIcon>
+            </button>
+          )}
           <button
             type="button"
             className="sidebar-icon-button"
@@ -648,13 +669,15 @@ export const Sidebar = (props: SidebarProps) => {
           {props.onNewGroup && (
             <GroupSidebar
               groups={props.groups ?? EMPTY_GROUPS}
-              bots={props.bots}
               threads={props.threads}
               attentionThreadIds={attentionThreadIds}
               channelWorking={channelWorking}
               selectedThreadId={props.selectedThreadId}
               onSelect={selectThread}
               onCreate={createChannel}
+              onInvite={props.onInvitePerson ? invitePerson : undefined}
+              messages={messages}
+              runs={runs}
               onSearch={openSearch}
               onEdit={editChannel}
               onDelete={props.onDeleteGroup ? deleteChannel : undefined}
@@ -664,24 +687,6 @@ export const Sidebar = (props: SidebarProps) => {
           <div className="bot-groups work-mode-dms">{renderBotEntries("work")}</div>
         </div>
       </div>
-      {props.onInvitePerson && (
-        <button
-          type="button"
-          className="button button-quiet sidebar-invite"
-          onClick={() => navigate(() => props.onInvitePerson?.())}
-        >
-          {t("Convidar pessoa")}
-        </button>
-      )}
-      {props.onRecovery && (props.recoveryCount ?? 0) > 0 && (
-        <button type="button" className="sidebar-recovery" onClick={() => navigate(() => props.onRecovery?.())}>
-          <SidebarIcon>
-            <circle cx="12" cy="12" r="9" />
-            <path d="M12 7v5l3 2" />
-          </SidebarIcon>
-          <span>{t("Interrupted tasks")}</span>
-        </button>
-      )}
       <div className="sidebar-footer">
         <div className="sidebar-user-row">
           <button type="button" className="user-chip" onClick={() => navigate(props.onSettings)}>
@@ -695,6 +700,21 @@ export const Sidebar = (props: SidebarProps) => {
               </small>
             </span>
           </button>
+          {props.onRecovery && (props.recoveryCount ?? 0) > 0 && (
+            <button
+              type="button"
+              className="sidebar-recovery-badge"
+              aria-label={t("Interrupted tasks count", { count: props.recoveryCount ?? 0 })}
+              title={t("Interrupted tasks")}
+              onClick={() => navigate(() => props.onRecovery?.())}
+            >
+              <SidebarIcon>
+                <circle cx="12" cy="12" r="9" />
+                <path d="M12 7v5l3 2" />
+              </SidebarIcon>
+              <span aria-hidden="true">{props.recoveryCount}</span>
+            </button>
+          )}
           <NotificationBell
             notifications={notifications}
             messages={messages}
@@ -838,7 +858,13 @@ const BotEntryView = ({
 }) => {
   const [menuOpen, setMenuOpen] = useState(false)
   const [conversationsOpen, setConversationsOpen] = useState(false)
+  const [compactOpen, setCompactOpen] = useState(false)
+  const compactTreeId = useId()
   const showTree = conversationsOpen
+  const openConversations = (): void => {
+    setCompactOpen(false)
+    setConversationsOpen(true)
+  }
   const selectConversation = (threadId: Id): void => {
     setConversationsOpen(false)
     onSelectThread(threadId)
@@ -867,6 +893,7 @@ const BotEntryView = ({
   // biome-ignore lint/correctness/useExhaustiveDependencies: dismiss on any navigation, including another bot's thread
   useEffect(() => {
     setMenuOpen(false)
+    setCompactOpen(false)
     setConversationsOpen(false)
     setSelectionMode(false)
     setSelectionPage(0)
@@ -922,6 +949,7 @@ const BotEntryView = ({
   const approvals = pendingApprovalTargets(botMessages)
   const unread = threads.reduce((count, thread) => count + (thread.id === selectedThreadId ? 0 : thread.unread), 0)
   const preview = latestPreview({ threadIds: ids, messages, runs })
+  const rowTime = getSidebarRowTime(getLastActivityAt(threads.filter((thread) => thread.archivedAt === null)))
   const reason =
     approvals.length || waiting?.kind === "approval"
       ? t("your approval")
@@ -969,7 +997,7 @@ const BotEntryView = ({
   )
   const sidebarThreads = useMemo(
     () =>
-      showTree
+      showTree || compactOpen
         ? getSidebarThreads(
             conversationThreads.filter((thread) => thread.archivedAt === null),
             routineRuns,
@@ -979,16 +1007,34 @@ const BotEntryView = ({
             routineRunCountsToday,
           )
         : [],
-    [showTree, conversationThreads, routineRuns, selectedThreadId, runningThreadIds, routineIds, routineRunCountsToday],
+    [
+      showTree,
+      compactOpen,
+      conversationThreads,
+      routineRuns,
+      selectedThreadId,
+      runningThreadIds,
+      routineIds,
+      routineRunCountsToday,
+    ],
   )
   const [showAllConversations, setShowAllConversations] = useState(false)
+  const [conversationPage, setConversationPage] = useState(0)
   const routineEntries = sidebarThreads.filter((entry) => entry.thread.kind === "routine" && !entry.deletedRoutine)
   const conversationEntries = sidebarThreads.filter((entry) => !routineEntries.includes(entry))
+  const recentConversations = conversationEntries.slice(0, MAX_SIDEBAR_CONVERSATIONS)
+  const selectedConversation = conversationEntries.find((entry) => entry.thread.id === selectedThreadId)
+  const compactConversations =
+    selectedConversation && !recentConversations.includes(selectedConversation)
+      ? recentConversations.slice(0, MAX_SIDEBAR_CONVERSATIONS - 1).concat(selectedConversation)
+      : recentConversations
+  const visibleConversationPage = Math.min(
+    conversationPage,
+    Math.max(0, Math.ceil(conversationEntries.length / 100) - 1),
+  )
   const shownConversations = showAllConversations
-    ? conversationEntries
-    : conversationEntries.filter(
-        (entry, index) => index < MAX_SIDEBAR_CONVERSATIONS || entry.thread.id === selectedThreadId,
-      )
+    ? conversationEntries.slice(visibleConversationPage * 100, (visibleConversationPage + 1) * 100)
+    : compactConversations
   const botUnread = unread
   const hiddenConversationCount = conversationEntries.length - shownConversations.length
   const selectedRoutineEntry = routineEntries.find((entry) => entry.thread.id === selectedThreadId)
@@ -1016,6 +1062,13 @@ const BotEntryView = ({
     isRoutineConversation({ thread, runs, routineRuns, routines: [...routinesById.values()] }),
   )
   const hiddenThreadIds = new Set(pendingDelete?.targets.map((target) => target.id) ?? [])
+  const compactSidebarThreads = sidebarThreads.filter(({ thread }) => !hiddenThreadIds.has(thread.id))
+  const hasCompactHistory =
+    !compact &&
+    conversationThreads.filter(
+      (thread) =>
+        thread.archivedAt === null && !thread.groupId && !thread.groupThreadId && !hiddenThreadIds.has(thread.id),
+    ).length > 1
   const openDeletePrompt = async (thread: Thread): Promise<void> => {
     if (!onGetThreadDeletePreview || pendingDelete) return
     setActionError(null)
@@ -1184,16 +1237,8 @@ const BotEntryView = ({
         selected={selected}
         rowAttention={badgeState ?? undefined}
         title={status || preview || undefined}
-        leading={<BotAvatar bot={bot} size={22} {...(avatarState ? { state: avatarState } : {})} motion="idle" />}
-        label={
-          <>
-            <strong title={bot.name}>{bot.name}</strong>
-            <small className="bot-role visually-hidden">{bot.roleLine || bot.title || t("Bot local")}</small>
-            <small className={bot.paused ? "bot-preview paused" : "bot-preview"} title={status || preview || undefined}>
-              {status || preview || t("Start a conversation")}
-            </small>
-          </>
-        }
+        leading={<BotAvatar bot={bot} size={32} {...(avatarState ? { state: avatarState } : {})} motion="idle" />}
+        label={<BotRowLabel bot={bot} preview={status || preview || t("Start a conversation")} time={rowTime} />}
         trailing={
           trailingState ? (
             <SidebarDot tone={trailingState} label={status ?? t("Em execução")} />
@@ -1236,13 +1281,44 @@ const BotEntryView = ({
                 <span className="sidebar-status-dot" />
               </button>
             ) : null}
+            {hasCompactHistory && (
+              <button
+                type="button"
+                className="bot-thread-toggle"
+                aria-label={t("Conversations for {name}", { name: bot.name })}
+                aria-expanded={compactOpen}
+                aria-controls={compactOpen ? compactTreeId : undefined}
+                onClick={() => setCompactOpen(!compactOpen)}
+              >
+                <SidebarIcon>
+                  <path d="m9 6 6 6-6 6" />
+                </SidebarIcon>
+              </button>
+            )}
             <BotActionsMenu
               name={bot.name}
               open={menuOpen}
               onOpenChange={setMenuOpen}
               onSettings={() => onSettings(bot.id)}
               onRoutines={() => onRoutines(bot.id)}
-              onConversations={() => setConversationsOpen(true)}
+              onConversations={openConversations}
+              conversations={{
+                onNewThread: () => onNewThread(bot.id),
+                onSelectThreads:
+                  onArchiveThreads || onDeleteThreads
+                    ? () => {
+                        openConversations()
+                        setSelectionMode(true)
+                      }
+                    : undefined,
+                onDeleteOldAutomatic: onDeleteThreads ? () => setOldAutomaticOpen(true) : undefined,
+                onArchived: onLoadArchivedThreads
+                  ? () => {
+                      openConversations()
+                      if (!archivedOpen) void toggleArchives()
+                    }
+                  : undefined,
+              }}
               onDelete={onDelete ? () => setDeleting(true) : undefined}
             />
           </>
@@ -1254,6 +1330,41 @@ const BotEntryView = ({
         }}
       />
       {deleting && onDelete && <DeleteBotDialog bot={bot} onDelete={onDelete} onClose={() => setDeleting(false)} />}
+      {hasCompactHistory && compactOpen && !conversationsOpen && (
+        <section
+          className="bot-thread-tree"
+          id={compactTreeId}
+          aria-label={t("Recent conversations for {name}", { name: bot.name })}
+        >
+          {compactSidebarThreads.slice(0, MAX_SIDEBAR_CONVERSATIONS).map(({ thread }) => (
+            <button
+              key={thread.id}
+              type="button"
+              className={`thread-row ${thread.id === selectedThreadId ? "selected" : ""}`}
+              aria-current={thread.id === selectedThreadId ? "page" : undefined}
+              onClick={() => selectConversation(thread.id)}
+            >
+              <span className="thread-copy">
+                <strong>{getSidebarThreadTitle(thread)}</strong>
+                <small>{relativeThreadDate(thread.updatedAt)}</small>
+              </span>
+            </button>
+          ))}
+          {compactSidebarThreads.length > MAX_SIDEBAR_CONVERSATIONS && (
+            <button
+              type="button"
+              className="new-thread-row"
+              onClick={() => {
+                openConversations()
+                setShowAllConversations(true)
+                setConversationPage(0)
+              }}
+            >
+              {t("See all conversations")}
+            </button>
+          )}
+        </section>
+      )}
       {showTree && (
         <Modal
           title={t("Conversations for {name}", { name: bot.name })}
@@ -1423,6 +1534,26 @@ const BotEntryView = ({
               <button type="button" className="new-thread-row" onClick={() => setShowAllConversations(true)}>
                 {t("Show more conversations", { count: hiddenConversationCount })}
               </button>
+            )}
+            {!selectionMode && showAllConversations && conversationEntries.length > 100 && (
+              <div className="thread-list-tools">
+                <button
+                  type="button"
+                  className="thread-list-tool"
+                  disabled={visibleConversationPage === 0}
+                  onClick={() => setConversationPage(visibleConversationPage - 1)}
+                >
+                  {t("Previous conversations")}
+                </button>
+                <button
+                  type="button"
+                  className="thread-list-tool"
+                  disabled={(visibleConversationPage + 1) * 100 >= conversationEntries.length}
+                  onClick={() => setConversationPage(visibleConversationPage + 1)}
+                >
+                  {t("Next conversations")}
+                </button>
+              </div>
             )}
             {visibleRoutineIds.length > 0 && (
               <RoutinesRow

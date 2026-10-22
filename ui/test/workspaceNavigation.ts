@@ -19,3 +19,14 @@ export const showBotSettings = (name = "mark"): void => {
   fireEvent.click(screen.getByRole("button", { name: `Ações de ${name}` }))
   fireEvent.click(screen.getByRole("menuitem", { name: "Avançado" }))
 }
+
+export const chooseBotAction = (action: string, name = "mark"): void => {
+  fireEvent.click(screen.getByRole("button", { name: `Ações de ${name}` }))
+  fireEvent.click(screen.getByRole("menuitem", { name: action }))
+}
+
+/** Channel team actions ("Perguntar a todos", "Pedir resumo do time") live in one composer menu. */
+export const chooseTeamAction = (action: string): void => {
+  fireEvent.click(screen.getByRole("button", { name: "Ações do time" }))
+  fireEvent.click(screen.getByRole("menuitem", { name: action }))
+}

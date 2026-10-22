@@ -33,15 +33,24 @@ viewportWidths.forEach((width) => {
     const create = page.getByRole("dialog", { name: "Criar canal", exact: true })
     await create.getByRole("textbox", { name: "Nome do canal" }).fill("Produto")
     await create.getByRole("checkbox", { name: "mark", exact: true }).check()
+
+    await expect(create.locator("..")).toHaveCSS("z-index", "1000")
+    await create.getByRole("button", { name: "Personalizar", exact: true }).click()
+    await expect(create.getByRole("radio", { name: "Cor Automática", exact: true })).toBeVisible()
+    await create.getByRole("button", { name: "Personalizar", exact: true }).click()
+    const evidence = process.env.TOURI_E2E_EVIDENCE_DIR
+    if (evidence) {
+      await mkdir(evidence, { recursive: true })
+      await page.screenshot({ path: resolve(evidence, `channel-create-${width}.png`) })
+    }
     await create.getByRole("button", { name: "Criar canal", exact: true }).click()
     await expect(page.getByRole("textbox", { name: "Mensagem para Produto", exact: true })).toBeVisible()
 
-    const toggle = page.getByRole("button", { name: "Painel do canal", exact: true })
+    const toggle = page.getByRole("button", { name: /^Membros do canal:/ })
     await toggle.click()
     await panelModule.requested
     const loading = page.getByRole("complementary", { name: "Carregando…" })
     await expect(loading).toBeVisible()
-    const evidence = process.env.TOURI_E2E_EVIDENCE_DIR
     if (evidence) {
       await mkdir(evidence, { recursive: true })
       await page.screenshot({ path: resolve(evidence, `loading-panel-${width}.png`) })

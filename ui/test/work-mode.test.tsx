@@ -102,8 +102,11 @@ describe("sidebar work mode", () => {
     expect(restoredChannel).toBeVisible()
     fireEvent.click(restoredChannel)
     await screen.findByRole("textbox", { name: "Mensagem para Equipe QA" })
-    expect(screen.getByText("Canais / Equipe QA")).toBeVisible()
-    fireEvent.click(screen.getByRole("button", { name: "Editar canal" }))
+    expect(document.querySelector(".group-header .chat-header-crumb")).toBeNull()
+    const header = document.querySelector<HTMLElement>(".group-header")
+    if (!header) throw new Error("Missing channel header")
+    fireEvent.click(within(header).getByRole("button", { name: "Ações do canal Equipe QA" }))
+    fireEvent.click(screen.getByRole("menuitem", { name: "Editar canal" }))
     const editChannel = await screen.findByRole("dialog", { name: "Editar canal" })
     expect(within(editChannel).getByRole("textbox", { name: "Nome do canal" })).toHaveValue("Equipe QA")
   })
@@ -280,7 +283,7 @@ describe("sidebar design", () => {
     expect(channelRows[0]?.querySelector(".sidebar-unread")).toHaveTextContent("12")
     expect(channelRows[0]?.querySelector(".group-mascots")).toBeNull()
     expect(screen.getByRole("button", { name: "Buscar canais e mensagens" })).toBeVisible()
-    expect(channelRows[0]?.querySelectorAll(".channel-bot-avatar")).toHaveLength(2)
+    expect(channelRows[0]?.querySelectorAll(".channel-bot-avatar")).toHaveLength(0)
   })
 
   it("shows one quiet preview per direct message and keeps the channel header free of counts", async () => {
@@ -292,7 +295,8 @@ describe("sidebar design", () => {
 
     const channels = screen.getByRole("region", { name: "Canais" })
 
-    expect(channels.querySelector(".group-sidebar-heading")).toHaveTextContent(/^Canais\s*\+$/)
+    expect(within(channels).getByRole("heading", { name: "Canais" })).toBeVisible()
+    expect(within(channels).getByRole("button", { name: "Convidar pessoa" })).toHaveTextContent("+ Convidar")
     expect(
       document.querySelectorAll("#sidebar-mode-panel-work .bot-preview:not(.visually-hidden):not(.paused)"),
     ).toHaveLength(api.getState().bots.filter((bot) => !bot.paused).length)
@@ -354,7 +358,7 @@ describe("sidebar design", () => {
     const actions = screen.getByRole("button", { name: "Ações de mark" })
 
     actions.focus()
-    await user.keyboard("{ArrowDown}{Home}{ArrowDown}{ArrowDown}{Enter}")
+    await user.keyboard("{ArrowDown}{End}{ArrowUp}{Enter}")
 
     const dialog = screen.getByRole("dialog", { name: "Conversas de mark" })
     expect(dialog).toHaveAttribute("aria-modal", "true")

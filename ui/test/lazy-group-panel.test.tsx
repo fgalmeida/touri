@@ -27,7 +27,7 @@ test("lets a person close the channel panel while its module is still loading", 
   fireEvent.click(within(channels).getByRole("button", { name: /^Produto/ }))
   await screen.findByRole("textbox", { name: "Mensagem para Produto" })
 
-  const toggle = await screen.findByRole("button", { name: "Painel do canal", exact: true })
+  const toggle = await screen.findByRole("button", { name: /^Membros do canal:/ })
   fireEvent.click(toggle)
   const loading = await screen.findByRole("complementary", { name: "Carregando…" })
   expect(loading).toHaveAttribute("aria-busy", "true")
@@ -35,5 +35,6 @@ test("lets a person close the channel panel while its module is still loading", 
 
   await waitFor(() => expect(screen.queryByRole("complementary", { name: "Carregando…" })).toBeNull())
   expect(toggle).toHaveAttribute("aria-expanded", "false")
+  await waitFor(() => expect(toggle).toHaveFocus())
   expect(screen.getByRole("textbox", { name: "Mensagem para Produto" })).toBeVisible()
 })

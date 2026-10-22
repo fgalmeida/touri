@@ -119,7 +119,7 @@ test("captures an open channel on desktop and phone", async ({ page }) => {
     await expect(page.getByRole("textbox", { name: "Mensagem para mark" })).toBeVisible()
     if (viewport.name === "phone") await page.locator(".mobile-menu-button").click()
     await page.getByRole("button", { name: /^Planejamento/ }).click()
-    await expect(page.locator(".chat-header-crumb")).toHaveText("Canais / Planejamento")
+    await expect(page.locator(".group-header .chat-header-crumb")).toHaveCount(0)
     await page.screenshot({
       path: resolve(evidence, `channel-open-${viewport.name}.png`),
       animations: "disabled",
@@ -232,7 +232,7 @@ for (const viewport of [
       const card = page.locator(".message-assistant .browser-activity-card")
       await expect(card).toHaveCount(1)
       await expect(card).toBeVisible()
-      await expect(page.locator(".group-member-count")).toContainText("2 pessoas · 1 bot")
+      await expect(page.locator(".channel-members-button")).toHaveAccessibleName("Membros do canal: 2 pessoas · 1 bot")
       await expect(page.locator(".group-header-actions")).toBeVisible()
       expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0)
       if (mode !== "finished") {

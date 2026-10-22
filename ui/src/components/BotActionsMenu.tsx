@@ -1,8 +1,16 @@
 import { useEffect, useId, useRef } from "react"
 import { createPortal } from "react-dom"
 import { t } from "../i18n"
-import { PanelIcon } from "./PanelIcon"
+import { PanelIcon, type PanelIconName } from "./PanelIcon"
 import { useAnchoredPopover } from "./useAnchoredPopover"
+
+/** Conversation housekeeping lives here, not in the sidebar list: the list stays a flat list of bots. */
+export type BotConversationActions = {
+  onNewThread?: (() => void) | undefined
+  onSelectThreads?: (() => void) | undefined
+  onDeleteOldAutomatic?: (() => void) | undefined
+  onArchived?: (() => void) | undefined
+}
 
 export const BotActionsMenu = ({
   name,
@@ -12,6 +20,7 @@ export const BotActionsMenu = ({
   onRoutines,
   onConversations,
   onDelete,
+  conversations = {},
 }: {
   name: string
   open: boolean
@@ -20,7 +29,10 @@ export const BotActionsMenu = ({
   onRoutines: () => void
   onConversations?: (() => void) | undefined
   onDelete?: (() => void) | undefined
+  conversations?: BotConversationActions
 }) => {
+  const conversationItems = getConversationItems(conversations)
+
   const container = useRef<HTMLDivElement>(null)
   const trigger = useRef<HTMLButtonElement>(null)
   const { surface: menu, style, portalRoot } = useAnchoredPopover(open, trigger)
@@ -115,6 +127,13 @@ export const BotActionsMenu = ({
               buttons[(next + buttons.length) % buttons.length]?.focus()
             }}
           >
+            {conversationItems.map((item) => (
+              <button key={item.label} type="button" role="menuitem" onClick={() => launch(item.onSelect)}>
+                <PanelIcon name={item.icon} />
+                <span>{item.label}</span>
+              </button>
+            ))}
+            {conversationItems.length > 0 && <hr className="menu-separator" />}
             <button type="button" role="menuitem" onClick={() => launch(onSettings)}>
               <PanelIcon name="settings" />
               <span>{t("Advanced")}</span>
@@ -142,4 +161,17 @@ export const BotActionsMenu = ({
         )}
     </div>
   )
+}
+
+type ConversationItem = { label: string; icon: PanelIconName; onSelect: (() => void) | undefined }
+
+const getConversationItems = (conversations: BotConversationActions) => {
+  const items: Array<ConversationItem> = [
+    { label: t("Nova conversa"), icon: "plus", onSelect: conversations.onNewThread },
+    { label: t("Select conversations…"), icon: "check", onSelect: conversations.onSelectThreads },
+    { label: t("Delete old automatic conversations…"), icon: "trash", onSelect: conversations.onDeleteOldAutomatic },
+    { label: t("Archived"), icon: "archive", onSelect: conversations.onArchived },
+  ]
+
+  return items.flatMap(({ label, icon, onSelect }) => (onSelect ? [{ label, icon, onSelect }] : []))
 }

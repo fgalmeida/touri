@@ -254,6 +254,108 @@ it("keeps unread counts visible when the conversation is beyond the first five r
   expect(within(conversationTree).getByRole("img", { name: "1 mensagem não lida" })).toBeVisible()
 })
 
+it("keeps an older selected conversation within the five compact rows", () => {
+  const { bots, threads } = fixture()
+  const bot = bots[0]
+  const baseThread = threads[0]
+  if (!bot || !baseThread) throw new Error("Missing conversation fixture")
+  const conversations = Array.from({ length: 7 }, (_, index) =>
+    makeThread(baseThread, `conversation-${index}`, bot.id, { updatedAt: T0 + 7 - index }),
+  )
+  const selectedThreadId = conversations.at(-1)?.id ?? null
+  renderSidebar({ bots: [bot], threads: conversations, selectedBotId: bot.id, selectedThreadId })
+
+  const conversationTree = openConversations("alfa")
+
+  expect(conversationTree.querySelectorAll(".thread-row")).toHaveLength(5)
+  expect(conversationTree.querySelectorAll(".thread-row.selected")).toHaveLength(1)
+})
+
+it("pages the full conversation list instead of mounting all history", () => {
+  const { bots, threads } = fixture()
+  const bot = bots[0]
+  const baseThread = threads[0]
+  if (!bot || !baseThread) throw new Error("Missing conversation fixture")
+  const conversations = Array.from({ length: 105 }, (_, index) =>
+    makeThread(baseThread, `conversation-${index}`, bot.id, { updatedAt: T0 + 105 - index }),
+  )
+  renderSidebar({ bots: [bot], threads: conversations, selectedBotId: bot.id })
+  const conversationTree = openConversations("alfa")
+
+  fireEvent.click(within(conversationTree).getByRole("button", { name: /^Mostrar mais/ }))
+
+  expect(conversationTree.querySelectorAll(".thread-row")).toHaveLength(100)
+  fireEvent.click(within(conversationTree).getByRole("button", { name: "Próximas conversas" }))
+  expect(conversationTree.querySelectorAll(".thread-row")).toHaveLength(5)
+  fireEvent.click(within(conversationTree).getByRole("button", { name: "Conversas anteriores" }))
+  expect(conversationTree.querySelectorAll(".thread-row")).toHaveLength(100)
+})
+
+it("hides expanded compact history when only one conversation remains", () => {
+  const { bots, threads } = fixture()
+  const bot = bots[0]
+  const main = threads[0]
+  if (!bot || !main) throw new Error("Missing conversation fixture")
+  const conversation = makeThread(main, "other-conversation", bot.id, { kind: "chat" })
+  const view = renderSidebar({
+    bots: [bot],
+    threads: [main, conversation],
+    selectedBotId: bot.id,
+    selectedThreadId: main.id,
+  })
+
+  fireEvent.click(screen.getByRole("button", { name: "Conversas de alfa" }))
+  expect(screen.getByRole("region", { name: "Conversas recentes de alfa" })).toBeVisible()
+
+  view.update({ threads: [main] })
+
+  expect(screen.queryByRole("button", { name: "Conversas de alfa" })).toBeNull()
+  expect(screen.queryByRole("region", { name: "Conversas recentes de alfa" })).toBeNull()
+})
+
+it("hides pending deletions from compact history and restores them on undo", () => {
+  const { bots, threads } = fixture()
+  const bot = bots[0]
+  const main = threads[0]
+  if (!bot || !main) throw new Error("Missing conversation fixture")
+  const conversation = makeThread(main, "temporary-conversation", bot.id, {
+    kind: "chat",
+    title: "Conversa temporária",
+  })
+  const other = makeThread(main, "other-conversation", bot.id, { kind: "chat" })
+  const targets = [{ id: conversation.id, title: conversation.title, messageCount: 1 }]
+  const deletion = {
+    pending: { id: "pending-deletion", botId: bot.id, targets },
+    error: null,
+    queue: vi.fn(() => true),
+    undo: vi.fn(),
+    dismiss: vi.fn(),
+  }
+  const view = renderSidebar({
+    bots: [bot],
+    threads: [main, other, conversation],
+    selectedBotId: bot.id,
+    threadDeletion: deletion,
+  })
+
+  fireEvent.click(screen.getByRole("button", { name: "Conversas de alfa" }))
+
+  const compactHistory = screen.getByRole("region", { name: "Conversas recentes de alfa" })
+  expect(within(compactHistory).queryByText("Conversa temporária")).toBeNull()
+
+  view.update({
+    threadDeletion: {
+      pending: null,
+      error: null,
+      queue: deletion.queue,
+      undo: deletion.undo,
+      dismiss: deletion.dismiss,
+    },
+  })
+
+  expect(within(compactHistory).getByText("Conversa temporária")).toBeVisible()
+})
+
 it("shows active work as a clear navigation action in both languages", () => {
   const { bots, threads } = fixture()
   const running = run("run-active", "bot-alfa", "thread-alfa")
@@ -547,9 +649,9 @@ it("shows interrupted tasks only while pending and leaves the count on the notif
 
   view.update({ recoveryCount: 1, notifications: [failure] })
 
-  const recovery = screen.getByRole("button", { name: "Tarefas interrompidas", exact: true })
+  const recovery = screen.getByRole("button", { name: "Tarefas interrompidas: 1", exact: true })
   expect(recovery.querySelector("svg")).not.toBeNull()
-  expect(recovery).not.toHaveTextContent(/\d/)
+  expect(recovery).toHaveTextContent("1")
   expect(screen.getByRole("button", { name: "Notificações, 1 precisa de atenção" })).toBeVisible()
   expect(screen.getAllByText("1", { selector: ".notification-badge" })).toHaveLength(1)
 })
