@@ -7,6 +7,7 @@ import { buildChildEnv } from "../../kernel"
 import { ensurePrivateDirectoryAsync, writePrivateFileAsync } from "../../kernel/async-files"
 import { redactStructured } from "../../kernel/redact"
 import { getSavedBotModel } from "../../store/model"
+import { storedProviderLoginSource } from "../../vm/provider-login"
 import { commandOutputTail, createCommandOutput } from "../command-output"
 import { folderConfinementRequired, spawnFolderProvider, turnFolders } from "../folder-access"
 import { loadTurnImages } from "../loadTurnImages"
@@ -17,6 +18,7 @@ import { type ChildProcess, readProviderStderr, startLineReader, writeLine } fro
 import { stopProviderChildren, trackProviderProcess } from "../provider-processes"
 import { resolveProviderExecutable } from "../resolveProviderExecutable"
 import { asRecord, classifyProviderError, resolveExecutable, stringValue } from "../utils"
+import { createWarmSessions } from "../warm-session"
 import { claudeUserContent } from "./claudeUserContent"
 import { claudeSettings } from "./settings"
 
@@ -87,6 +89,7 @@ export const createClaudeAdapter = ({
   const commandName = command ?? process.env.TOURI_CLAUDE_BIN ?? "claude"
   const approvals = new Map<string, PendingApproval>()
   const children = new Set<ChildProcess>()
+  const warmSessions = createWarmSessions()
 
   const detect = async (): Promise<
     Result<{ path: string; version: string; loggedIn: boolean }, "cli_missing" | "cli_auth">
@@ -135,17 +138,28 @@ export const createClaudeAdapter = ({
       if (typeof value === "string") kernel.addRedactionValue(value)
     Object.assign(env, userSettings.authEnv, args.env)
     Object.assign(env, applyProviderPrivacy(env, cliTelemetryOff(kernel)))
-    await claudeConfig({ args, root: kernel.paths.appData, path: configPath })
-    await (args.execution?.writeFile ?? writePrivateFileAsync)({
-      root: kernel.paths.appData,
-      path: settingsPath,
-      content: JSON.stringify(userSettings.settings),
-    })
-    await (args.execution?.writeFile ?? writePrivateFileAsync)({
-      root: kernel.paths.appData,
-      path: systemPath,
-      content: args.developerInstructions,
-    })
+    const warmKey =
+      args.conversationOnly && !args.execution && storedProviderLoginSource(kernel, args.bot) !== "vault"
+        ? warmSessions.getKey({
+            ...args,
+            env,
+            developerInstructions: JSON.stringify([args.developerInstructions, userSettings.settings]),
+          })
+        : null
+    const retained = warmSessions.getAvailable(warmKey, args.session?.externalSessionId)
+    if (!retained) {
+      await claudeConfig({ args, root: kernel.paths.appData, path: configPath })
+      await (args.execution?.writeFile ?? writePrivateFileAsync)({
+        root: kernel.paths.appData,
+        path: settingsPath,
+        content: JSON.stringify(userSettings.settings),
+      })
+      await (args.execution?.writeFile ?? writePrivateFileAsync)({
+        root: kernel.paths.appData,
+        path: systemPath,
+        content: args.developerInstructions,
+      })
+    }
     const sessionId = args.session?.externalSessionId ?? randomUUID()
     const commandArgs = [
       "-p",
@@ -162,13 +176,13 @@ export const createClaudeAdapter = ({
       configPath,
       // claude.ai connectors only load without strict mode. They are an explicit per-bot opt-in for
       // local bots; their tool calls still go through the approval prompt, not the touri gateway.
-      ...(args.bot.claudeAiConnectors && !args.execution ? [] : ["--strict-mcp-config"]),
+      ...(args.bot.claudeAiConnectors && !args.execution && !args.conversationOnly ? [] : ["--strict-mcp-config"]),
       // Do not merge user/project/local permission rules or auto mode into a bot's policy.
       // Authentication still uses the CLI's normal credential store.
       "--setting-sources=",
       "--settings",
       settingsPath,
-      "--append-system-prompt-file",
+      args.conversationOnly ? "--system-prompt-file" : "--append-system-prompt-file",
       systemPath,
       "--permission-mode",
       permissionMode(args),
@@ -184,28 +198,44 @@ export const createClaudeAdapter = ({
     if (projectDataDir) commandArgs.push("--add-dir", projectDataDir)
     if (!args.execution && env.TMPDIR) commandArgs.push("--add-dir", env.TMPDIR)
     for (const folder of turnFolders(args)) commandArgs.push("--add-dir", folder.path)
-    if (process.platform !== "darwin" && folderConfinementRequired(args))
+    if (!retained && process.platform !== "darwin" && folderConfinementRequired(args))
       await ensurePrivateDirectoryAsync({
         root: args.bot.homeDir,
         path: join(args.bot.homeDir, ".touri-claude"),
       })
-    const spawned = spawnFolderProvider(kernel, args, {
-      cmd: resolved.path,
-      args: commandArgs,
-      cwd: args.fingerprint.cwd,
-      env: applyProviderPrivacy(env, cliTelemetryOff(kernel)),
-    })
-    if (!spawned.success)
+    const candidate = retained
+      ? null
+      : spawnFolderProvider(kernel, args, {
+          cmd: resolved.path,
+          args: commandArgs,
+          cwd: args.fingerprint.cwd,
+          env: applyProviderPrivacy(env, cliTelemetryOff(kernel)),
+        })
+    if (candidate && !candidate.success)
       return {
         success: false,
-        errorCode: spawned.errorCode === "ENOENT" ? "cli_missing" : "cli_crash",
-        error: spawned.error,
+        errorCode: candidate.errorCode === "ENOENT" ? "cli_missing" : "cli_crash",
+        error: candidate.error,
       }
+    const lease =
+      retained ??
+      warmSessions.acquire(
+        warmKey,
+        () => {
+          if (!candidate?.success) throw new Error("Provider process unavailable")
+          return candidate
+        },
+        args.env.TMPDIR,
+      )
+    const spawned = lease.child
+    if (lease.reused) args.onProcessReused?.()
+    else args.onProcessSpawned?.()
     children.add(spawned)
     void spawned.exited.then(() => children.delete(spawned))
-    if (!args.execution) await trackProviderProcess(kernel, spawned)
+    if (!args.execution && !lease.reused) await trackProviderProcess(kernel, spawned)
     let completed = false
     let stopped = false
+    let externalSessionId = sessionId
     const toolCalls = new Map<string, Extract<MessagePart, { type: "tool_call" }>>()
     const outputs = new Map<
       string,
@@ -255,8 +285,16 @@ export const createClaudeAdapter = ({
       if (completed) return
       completed = true
       stopReader()
-      spawned.kill("SIGTERM")
+      lease.release(
+        warmKey !== null && result.success && result.status === "succeeded",
+        result.success ? result.externalSessionId : undefined,
+      )
       finish(result.success ? result : { ...result, error: kernel.redact(result.error) })
+    }
+    if (lease.reused) {
+      turnStarted = true
+      args.onEvent({ type: "session", externalSessionId: sessionId, rolloutPath: args.session?.rolloutPath ?? null })
+      args.onEvent({ type: "turn_started", externalTurnId: `claude-turn-${sessionId}` })
     }
     const input = args.handoffPacket ? `${args.handoffPacket}\n\n${inputText(args.input)}` : inputText(args.input)
     const onLine = (line: string): void => {
@@ -284,9 +322,10 @@ export const createClaudeAdapter = ({
       if (type === "system") {
         const subtype = stringValue(frame.subtype)
         if (subtype === "init" || frame.session_id) {
+          externalSessionId = stringValue(frame.session_id) ?? externalSessionId
           args.onEvent({
             type: "session",
-            externalSessionId: stringValue(frame.session_id) ?? sessionId,
+            externalSessionId,
             rolloutPath: null,
           })
           if (!turnStarted) {
@@ -439,7 +478,7 @@ export const createClaudeAdapter = ({
         })
         complete({
           success: true,
-          externalSessionId: sessionId,
+          externalSessionId,
           rolloutPath: null,
           status: isError ? "failed" : stopped ? "interrupted" : "succeeded",
         })
@@ -508,7 +547,7 @@ export const createClaudeAdapter = ({
     if (!model.success) return model
 
     const turnArgs = Object.assign({}, args, { bot: Object.assign({}, args.bot, { model: model.model }) })
-    return withLocalTurnTemp(kernel, turnArgs, startAttempt)
+    return withLocalTurnTemp(kernel, turnArgs, startAttempt, warmSessions.getLifetime)
   }
 
   const answerApproval = async ({
@@ -544,6 +583,7 @@ export const createClaudeAdapter = ({
   }
 
   const shutdown = async (): Promise<void> => {
+    warmSessions.stop()
     await stopProviderChildren(children)
   }
 

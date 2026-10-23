@@ -2,6 +2,7 @@ import type { Message, MessagePart, Run, ToolCallPart } from "@touri/contracts"
 import { useState } from "react"
 import { createRoot } from "react-dom/client"
 import { createMockApi } from "../../src/api/mock"
+import { type AvatarRuntime, AvatarRuntimeProvider } from "../../src/components/AvatarRuntime"
 import { VirtualMessageList } from "../../src/components/ChatPanel"
 import "../../src/styles.css"
 
@@ -25,7 +26,8 @@ parts.push({
   type: "text",
   text: "## Revisão concluída\n\nOs 40 passos foram concluídos. As notas estão prontas para revisão.\n\n```mermaid\nflowchart LR\n  A[Revisar] --> B[Concluir]\n```",
 })
-const waiting = params.get("scene") === "waiting"
+const streaming = params.get("scene") === "streaming"
+const waiting = params.get("scene") === "waiting" || streaming
 const initial: Message = {
   id: "activity-reply",
   threadId: "activity-thread",
@@ -35,7 +37,7 @@ const initial: Message = {
   status: waiting ? "streaming" : "complete",
   runId: "activity-run",
   text: "",
-  parts: waiting ? [{ type: "reasoning", text: "Conferindo o contexto da solicitação." }] : parts,
+  parts: streaming ? [] : waiting ? [{ type: "reasoning", text: "Conferindo o contexto da solicitação." }] : parts,
   sender: null,
   source: "local",
   createdAt: waiting ? now : now - 180_000,
@@ -60,6 +62,18 @@ const initialRun: Run = {
   providerStartedAt: initial.createdAt,
   finishedAt: waiting ? null : now,
 }
+// Keep the avatar snapshot one update behind the transcript to reproduce the first-word race.
+const staleRuntime: AvatarRuntime = {
+  bots: [],
+  threads: createMockApi()
+    .getState()
+    .threads.slice(0, 1)
+    .map((thread) => ({ ...thread, id: initial.threadId, botId: initialRun.botId })),
+  messages: [initial],
+  runs: [initialRun],
+  notifications: [],
+  loading: false,
+}
 const Fixture = () => {
   const [message, setMessage] = useState(initial)
   const [run, setRun] = useState(initialRun)
@@ -72,19 +86,22 @@ const Fixture = () => {
       },
     },
   })
+  const transcript = (
+    <VirtualMessageList
+      messages={[message]}
+      runs={[run]}
+      api={createMockApi()}
+      onSwitchBranch={() => undefined}
+      onRetry={async () => undefined}
+      onCancel={async () => setRun((value) => ({ ...value, status: "canceled", finishedAt: Date.now() }))}
+    />
+  )
   return (
     <main
       style={{ display: "flex", flexDirection: "column", height: "100dvh", maxWidth: 920, margin: "auto", padding: 24 }}
     >
       <h1 style={{ fontSize: 18 }}>touri · Revisão das notas</h1>
-      <VirtualMessageList
-        messages={[message]}
-        runs={[run]}
-        api={createMockApi()}
-        onSwitchBranch={() => undefined}
-        onRetry={async () => undefined}
-        onCancel={async () => setRun((value) => ({ ...value, status: "canceled", finishedAt: Date.now() }))}
-      />
+      {streaming ? <AvatarRuntimeProvider value={staleRuntime}>{transcript}</AvatarRuntimeProvider> : transcript}
     </main>
   )
 }

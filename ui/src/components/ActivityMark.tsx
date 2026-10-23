@@ -252,5 +252,9 @@ const getActivityLabel = ({
   if (quietMs >= 10_000 && activeToolFor(parts)) return t("A tarefa continua em execução.", {}, locale)
   if (quietMs >= 10_000 && providerAt) return t("Ainda aguardando a IA responder.", {}, locale)
 
+  const lastContent = parts.at(-1)
+  if (state === "thinking" && lastContent?.type === "text" && lastContent.text)
+    return activityLabelFor("typing", parts, locale)
+
   return activityLabelFor(state, parts, locale)
 }
