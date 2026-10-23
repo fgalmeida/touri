@@ -405,6 +405,10 @@ env: CLAUDE_CODE_ENABLE_TODO_TOOLS=1, CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
 
 ### 3.9 Grupos (schema 8)
 
+The Work navigation loads on its first opening and then stays mounted while switching
+sidebar modes, preserving channel rows and scroll position. Channel navigation and direct
+messages appear together after loading, so late content cannot move a row during activation.
+
 Groups have a name, mascot shape/seed/color, an ordered roster and an optional coordinator
 from that roster. Each group owns multiple conversations. Migration `0008.sql` is additive;
 existing bot conversations, permissions and provider sessions are preserved.
@@ -433,9 +437,28 @@ affect, including work reached while delegation approval is still pending. A den
 browser control and pending turns unchanged; a browser leaf can still be canceled in isolation.
 
 Parar cancels the active group turn, its delegated work and pending group turns. Editing members
-or the coordinator requires idle group conversations. Restart interrupts unfinished group turns
-without replaying tasks. Work lists channels as a hash, name, activity time and optional single-line
+or the coordinator requires idle group conversations. Eligible unfinished channel turns resume after
+restart and provider interruption, up to two automatic attempts recorded durably per original member
+turn. Completed members are not repeated. Stop remains authoritative while startup is waiting;
+no member starts after cancellation when the engine becomes ready. Stop, pending approvals and unconfirmed effects prevent
+automatic execution. A managed effect recorded in the durable work journal requires human review
+even if no reply part was saved; neither automatic recovery nor a simple retry may replay it.
+The manual resume action appears only after automatic recovery is exhausted or needs human review.
+A later reply to another channel request or from another member does not hide that action.
+Automatic recovery markers follow the selected interface language. An empty final response (no text
+or parts) fails visibly instead of succeeding.
+One human message starts one group turn and one execution per addressed member, including a
+repeated delivery acknowledgement. The aggregate group record is not another provider execution.
+
+Opening a channel always opens its original conversation. Other shared conversations, including
+routine runs, appear as cards with their latest reply in that channel; selecting a card opens the
+conversation. Cards retain the 50 most recently updated shared conversations, including newly
+arriving routine runs regardless of snapshot order. Private provider conversations never appear as channel cards or sidebar rows. The
+original channel conversation is not repeated beneath its own sidebar row. Routine conversations
+show their routine name and a localized short date, without an internal timestamp. Work lists channels as a hash, name, activity time and optional single-line
 message preview. Members appear in the channel header and panel, reached through the member count.
+The channel panel contains the channel name, people and bots with status, and Edit channel;
+it does not contain an internal turn-results board.
 The header has no repeated breadcrumb; edit and invite actions live in its ellipsis menu. The empty
 channel shows a short introduction and member avatars. The composer keeps team actions in one menu.
 

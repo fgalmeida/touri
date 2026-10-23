@@ -21,7 +21,7 @@ test.describe("mermaid production and desktop CSP", () => {
 
   test.beforeAll(async () => {
     // Compilation has its own allowance; the payload and interaction budgets below stay unchanged.
-    test.setTimeout(300_000)
+    test.setTimeout(600_000)
     const { build } = await import("vite")
     await build({
       root: uiRoot,
@@ -67,6 +67,8 @@ test.describe("mermaid production and desktop CSP", () => {
       "src/components/WorkspaceScreens.tsx",
       "src/components/GroupModal.tsx",
       "src/components/GroupPanel.tsx",
+      "src/components/Groups.tsx",
+      "src/components/DeleteGroupDialog.tsx",
       "src/components/RoutineEditor.tsx",
     ].map((key) => manifest[key])
     expect(optionalModules.every((chunk) => chunk?.isDynamicEntry && !initialFiles.has(chunk.file))).toBe(true)

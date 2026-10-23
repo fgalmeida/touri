@@ -49,6 +49,7 @@ test("the channel panel lists human members without exposing administrative fiel
 
   expect(await screen.findByText("Ana")).toBeVisible()
   expect(screen.getByText("Pessoa · @ana.silva")).toBeVisible()
+  expect(screen.queryByRole("region", { name: "Resultados do turno" })).toBeNull()
 })
 
 test("the channel header counts people and bots in both languages", () => {
