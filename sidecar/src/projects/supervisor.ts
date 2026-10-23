@@ -25,6 +25,7 @@ import { createBackgroundTask, getMeasuredStage, yieldBackground } from "../kern
 import type { PerformanceStageRunner } from "../kernel/performance"
 import { backoffDelay, debounce, sleep } from "../kernel/policy"
 import { linuxRuntimeEnvironment } from "../platform/linux-environment"
+import { getLocalProcessCommand } from "../platform/process-shell"
 import { projectSandboxCommand } from "../platform/project-sandbox"
 import { surfaceUncertainEffects } from "../runtime/work-notice"
 import { createWorkState, type WorkEffect, type WorkObservation, type WorkState } from "../runtime/work-state"
@@ -736,7 +737,6 @@ export const createSupervisor = ({
     if (!environment.success) return environment
     const command = spec.command.replaceAll("<dataDir>", project.dataDir)
     const shell = environment.env.SHELL ?? "/bin/sh"
-    const quotedCommand = command.replaceAll("'", "'\\''")
     const vm = spec.vmBotId ? kernel.services.use("vm.runtime") : null
     if (spec.vmBotId && !vm) return errorResult("PROCESS_START_FAILED", "VM indisponível")
     let release: (() => Promise<void>) | undefined
@@ -752,8 +752,7 @@ export const createSupervisor = ({
       return errorResult("DENIED", "A autorização mudou antes da execução.")
     }
     let localSpawn: Parameters<Kernel["spawnTree"]>[0] = {
-      cmd: shell,
-      args: ["-c", `exec ${shell} -c '${quotedCommand}'`],
+      ...getLocalProcessCommand({ command, env: environment.env }),
       cwd: spec.cwd,
       env: environment.env,
     }

@@ -574,8 +574,10 @@ outgoing replies, so a delayed reply cannot block `/stop`.
 
 ### 4.3 Supervised processes
 - **Defined** by the user (UI) or the agent (`process_define`), stored in `processes`.
-- **Spawn.** `node:child_process.spawn($SHELL, ['-lc', 'exec ' + command], {cwd, env, detached:true})`:
-  - The child leads its own process group (`pgid == pid`).
+- **Spawn.** Local processes use `kernel.spawnTree` with the validated working directory and resolved environment:
+  - macOS/Linux use `$SHELL` (falling back to `/bin/sh`) with `-c` and an `exec` wrapper. The child leads its own process group (`pgid == pid`).
+  - Windows uses case-insensitive `ComSpec` (falling back to `cmd.exe`) with `/d /s /c`. AutoRun scripts are disabled. The native helper preserves the approved shell command, including quoted executable paths, arguments and chaining, by adding only the outer quotes consumed by `/s`. Its job object owns the entire process tree.
+  - Restricted local processes still require the platform sandbox; an unsupported sandbox fails closed. VM processes continue to use `/bin/sh` inside the guest.
   - env = login-shell env + resolved `env_json`. `<dataDir>` is substituted in `cwd` and in `command`, for example `mongod --dbpath <dataDir>/mongo --port 27017 --bind_ip 127.0.0.1`.
 - **Dependencies.** `dependsOn` processes start first, in topological order (cycles are rejected at define time), and each must be `ready` before the next starts.
 - **Ready check.** One of:
@@ -593,7 +595,7 @@ outgoing replies, so a delayed reply cannot block `/stop`.
   - `on-failure`: backoff 1, 2, 4 … 60s. After 5 failures in 10 min the process is `crashed` and a notification goes out.
   - `always`: same backoff.
   - `never`.
-- **Stop.** SIGTERM to `-pgid`, then SIGKILL to `-pgid` after 5s.
+- **Stop.** On macOS/Linux, SIGTERM to `-pgid`, then SIGKILL to `-pgid` after 5s. On Windows, ending the native helper closes its job object and terminates its descendants.
 - **Quit.** All processes stop. On the next launch, `autostart` processes start again in dependency order.
 - **Orphan cleanup at boot.** For `process_runs` still marked live, if the pid is alive *and* `ps -o lstart= -p <pid>` equals `pid_start`, kill its group. Then mark the run `stopped` and autostart.
 - **Port detection.** Every 2s while any process is live, and right after a ready check:

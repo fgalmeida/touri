@@ -50,15 +50,39 @@ fn run_piped(args: Vec<OsString>) -> Result<i32, String> {
     use std::os::windows::process::CommandExt;
     let job = super::platform::windows_job::own_process_tree().map_err(|e| e.to_string())?;
     std::mem::forget(job);
-    std::process::Command::new(&args[0])
+    get_piped_command(&args)
         .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
-        .args(&args[1..])
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit())
         .status()
         .map(|status| status.code().unwrap_or(1))
         .map_err(|e| e.to_string())
+}
+
+#[cfg(windows)]
+fn get_piped_command(args: &[OsString]) -> std::process::Command {
+    use std::os::windows::process::CommandExt;
+
+    let mut command = std::process::Command::new(&args[0]);
+    let is_cmd = std::path::Path::new(&args[0])
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.eq_ignore_ascii_case("cmd.exe") || name.eq_ignore_ascii_case("cmd")
+        });
+    if is_cmd && args.len() == 5 && args[1] == "/d" && args[2] == "/s" && args[3] == "/c" {
+        // This is an approved shell program, not an argv value: cmd does not
+        // decode C-runtime backslash escapes. /s removes just this outer pair.
+        let mut script = OsString::from("\"");
+        script.push(&args[4]);
+        script.push("\"");
+        command.args(&args[1..4]).raw_arg(script);
+        return command;
+    }
+
+    command.args(&args[1..]);
+    command
 }
 
 // Flush prompts that do not end in a newline. No terminal output is logged here.
