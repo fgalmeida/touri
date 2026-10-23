@@ -1,7 +1,7 @@
 /**
  * The command interpreter that runs a project process locally. POSIX hosts keep `sh -c`;
  * Windows has no `/bin/sh`, so it uses the system `cmd.exe` (ComSpec), with `/d` to skip AutoRun
- * scripts and `/s` so cmd strips only the quotes the launcher adds around the command.
+ * scripts and `/s` so cmd strips only the outer quotes added by the native process helper.
  */
 export const getLocalProcessCommand = ({
   command,
@@ -13,6 +13,7 @@ export const getLocalProcessCommand = ({
   platform?: NodeJS.Platform
 }): { cmd: string; args: string[] } => {
   if (platform === "win32") return { cmd: getWindowsCommandInterpreter(env), args: ["/d", "/s", "/c", command] }
+
   const shell = env.SHELL ?? "/bin/sh"
   return { cmd: shell, args: ["-c", `exec ${shell} -c '${command.replaceAll("'", "'\\''")}'`] }
 }
