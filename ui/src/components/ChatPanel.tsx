@@ -815,11 +815,13 @@ const MessageBubble = ({
   )
   const quietBrowserNarration = hasBrowserTools && message.status === "streaming"
   const getBrowserRunLabel = () => {
-    if (browserHandoffExpired) return t("incomplete", {}, locale)
+    if (message.status === "canceled") return null
+    if (browserHandoffExpired || message.status === "failed") return t("incomplete", {}, locale)
     if (quietBrowserNarration) return t("in progress", {}, locale)
 
     return t("finished", {}, locale)
   }
+  const browserRunLabel = getBrowserRunLabel()
   const foldBrowserFlow = hasBrowserTools && message.status !== "streaming"
   const finalText = segments.filter((segment) => segment.type === "text").at(-1)
   const senderName = message.sender?.name ?? bot?.name ?? "touri"
@@ -1038,9 +1040,9 @@ const MessageBubble = ({
           <time dateTime={new Date(message.createdAt).toISOString()}>
             {new Date(message.createdAt).toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" })}
           </time>
-          {hasBrowserTools && (
+          {hasBrowserTools && browserRunLabel && (
             <span className="browser-run-state" role="status">
-              {getBrowserRunLabel()}
+              {browserRunLabel}
             </span>
           )}
           {message.role === "user" && message.delivery && (

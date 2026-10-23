@@ -255,6 +255,36 @@ it("folds narration and step rows into the finished card and shows only the fina
   expect(view.container.querySelectorAll(".browser-activity-history .browser-steps")).toHaveLength(2)
 })
 
+it("shows only the canceled status for a canceled browser turn", async () => {
+  const view = render(
+    <VirtualMessageList
+      {...props}
+      messages={[
+        message([...browserParts.slice(0, 4), { type: "text", text: "Voo por R$ 900" }], {
+          status: "canceled",
+          sender: { id: "bot-mark", name: "Lia" },
+        }),
+      ]}
+    />,
+  )
+
+  expect(await screen.findByText("Cancelado por você")).toBeVisible()
+  expect(screen.queryByText("concluído")).toBeNull()
+  expect(view.container.querySelector(".browser-run-state")).toBeNull()
+})
+
+it("marks a failed browser turn as incomplete instead of finished", async () => {
+  render(
+    <VirtualMessageList
+      {...props}
+      messages={[message(browserParts.slice(0, 4), { status: "failed", sender: { id: "bot-mark", name: "Lia" } })]}
+    />,
+  )
+
+  expect(await screen.findByText("não concluído")).toBeVisible()
+  expect(screen.queryByText("concluído", { exact: true })).toBeNull()
+})
+
 it("splits browser steps between narrations in the segment model", () => {
   const segments = assistantSegments(message(browserParts, { status: "streaming" }))
 

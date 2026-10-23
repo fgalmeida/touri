@@ -25,15 +25,14 @@ export const latestPreview = ({
 }
 
 const textOf = (message: Message, runs: ReadonlyArray<Run>, messages: ReadonlyArray<Message>): string => {
-  if (message.status === "canceled") return t("Cancelado por você")
+  if (message.status === "canceled") return getReadableText(message) || t("Cancelado por você")
   const error = runErrorFor(message)
   if (error) return error.title
   if (message.role === "system") return localizeNotice(message.text)
   const routineResult = getRoutineEmptyResultPreview(message, runs, messages)
   if (routineResult) return routineResult
-  if (message.text.trim()) return message.text
-  const text = message.parts.find((part) => part.type === "text" && part.text.trim())
-  if (text?.type === "text") return text.text
+  const readable = getReadableText(message)
+  if (readable) return readable
   const approval = [...message.parts].reverse().find((part) => part.type === "approval")
   if (approval?.type === "approval") {
     if (approval.decision === "pending") return "Aguardando sua aprovação"
@@ -44,6 +43,13 @@ const textOf = (message: Message, runs: ReadonlyArray<Run>, messages: ReadonlyAr
   }
   const notice = message.parts.find((part) => part.type === "notice" && part.text.trim())
   return notice?.type === "notice" ? localizeNotice(notice.text) : ""
+}
+
+const getReadableText = (message: Message): string => {
+  if (message.text.trim()) return message.text
+  const text = message.parts.find((part) => part.type === "text" && part.text.trim())
+
+  return text?.type === "text" ? text.text : ""
 }
 
 const getRoutineEmptyResultPreview = (
